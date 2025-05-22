@@ -1,4 +1,3 @@
-````markdown
 # QueueSystem
 
 Spring Boot, Redis, React로 만든 **Production-ready 대기열 시스템**  
