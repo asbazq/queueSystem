@@ -1,7 +1,7 @@
 # QueueSystem
 
-Spring Boot, Redis, React로 만든 **Production-ready 대기열 시스템**  
-G마켓 Redcarpet 아키텍처를 참고해 설계했으며, 단일 WebSocket → WS+SSE 확장, 운영 중 파라미터 조정, 트러블슈팅 기록
+Spring Boot, Redis **대기열 시스템**  
+
 ---
 
 ## 📦 주요 기능
