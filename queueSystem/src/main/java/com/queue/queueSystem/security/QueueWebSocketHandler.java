@@ -33,8 +33,13 @@ public class QueueWebSocketHandler extends TextWebSocketHandler
         String userId = UriComponentsBuilder.fromUri(session.getUri())
                                             .build().getQueryParams()
                                             .getFirst("userId");
+
+        String qid = UriComponentsBuilder.fromUri(session.getUri())
+                                            .build().getQueryParams()
+                                            .getFirst("qid");
+
         sessions.put(userId, session);
-        log.debug("WS OPEN {}", userId);
+        log.debug("WS OPEN qid={} userId={}", qid, userId);
     }
 
     /* 종료 → 이벤트 발행 */
@@ -45,8 +50,13 @@ public class QueueWebSocketHandler extends TextWebSocketHandler
                 ? UriComponentsBuilder.fromUri(session.getUri()).build()
                         .getQueryParams().getFirst("userId")
                 : "unknown";
-        log.debug("WS CLOSE {}", userId);
-        publisher.publishEvent(new UserDisconnectedEvent(userId));
+
+        String qid = session.getUri() != null
+                ? UriComponentsBuilder.fromUri(session.getUri()).build()
+                        .getQueryParams().getFirst("qid")
+                : "unknown";
+        log.debug("WS CLOSE qid={} userId={}", qid, userId);
+        publisher.publishEvent(new UserDisconnectedEvent(qid, userId));
     }
 
     /* ============== QueueNotifier 구현 ============== */
@@ -63,7 +73,10 @@ public class QueueWebSocketHandler extends TextWebSocketHandler
     }
 
     private void sendSilently(WebSocketSession s, String m) {
-        try { s.sendMessage(new TextMessage(m)); }
-        catch (Exception ex) { log.warn("WS send fail {}", s.getId(), ex); }
+        try { 
+            s.sendMessage(new TextMessage(m)); 
+        } catch (Exception ex) { 
+            log.warn("WS send fail {}", s.getId(), ex); 
+        }
     }
 }

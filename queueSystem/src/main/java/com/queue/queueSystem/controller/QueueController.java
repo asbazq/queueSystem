@@ -20,21 +20,21 @@ public class QueueController {
     private final QueueService svc;
 
     @PostMapping("/enter")
-    public QueueService.QueueResponse enter(@RequestParam("userId") String userId) {
-        return svc.enter(userId);
+    public QueueService.QueueResponse enter(@RequestParam String qid, @RequestParam("userId") String userId) {
+        return svc.enter(qid, userId);
     }
 
     @PostMapping("/leave")
-    public void leave(@RequestParam("userId") String userId) {
-        svc.leave(userId);
+    public void leave(@RequestParam String qid, @RequestParam("userId") String userId) {
+        svc.leave(qid, userId);
     }
 
     @GetMapping("/status")
-    public QueueService.QueueStatus status() { return svc.status(); }
+    public QueueService.QueueStatus status(@RequestParam String qid) { return svc.status(qid); }
 
     @GetMapping("/position")
-    public Map<String, Long> QueuePosition(@RequestParam("userId") String userId) {
-        return svc.QueuePosition(userId);
+    public Map<String, Long> QueuePosition(@RequestParam String qid, @RequestParam("userId") String userId) {
+        return svc.QueuePosition(qid, userId);
     }
 
 }
