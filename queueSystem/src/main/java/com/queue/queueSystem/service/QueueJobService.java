@@ -72,13 +72,18 @@ public class QueueJobService {
                         byte[] run  = runKey.getBytes();
                         for (String uid : promote) {
                             byte[] m = uid.getBytes();
-                            if (vipBatch.contains(uid)) {
+                            if (vipBatch != null && vipBatch.contains(uid)) {
                                 conn.zRem(vip, m);
                             } else {
                                 conn.zRem(wait, m);
                             }
                             conn.zAdd(run, now, uid.getBytes());
-                            log.info("Promote {} -> {} ({} queue)", uid, runKey, vipBatch.contains(uid)?"vip":"main");
+                            log.info(
+                                "Promote {} -> {} ({} queue)",
+                                uid,
+                                runKey,
+                                (vipBatch != null && vipBatch.contains(uid)) ? "vip" : "main"
+                            );
                         }
                         return null;
                     });
