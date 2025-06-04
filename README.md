@@ -98,6 +98,7 @@ npm start
 | VIP 진입 시 Main 화면 순번 오류   | 전체 브로드캐스트(`notifier.broadcast`) 사용 | 큐별 대기자만 `sendToUser`로 브로드캐스트 변경  |
 | diff 계산 오차               | diff+REST 혼용 → race condition 발생   | WebSocket으로 **절대 pos** 푸시 방식 전환  |
 | Redis `KEYS` 명령 과부하      | 대규모 키 스캔 시 블로킹                     | 운영 시 `SCAN` 명령으로 변경              |
+|VIP 큐 변화 시, main 큐 갱신X|broadcast에서 qid에 해당 대기열만 STATUS 메시지 전송|VIP 큐 변화 시 main 큐 상태도 함께 전송</br>→ 각 사용자에게 절대 순번이 포함된 STATUS 메시지 전송|
 
 ---
 
