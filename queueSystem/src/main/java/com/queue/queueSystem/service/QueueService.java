@@ -42,8 +42,8 @@ public class QueueService {
 
         if (totalRunningSize() < MAX_runnging) {
             redis.opsForZSet().add(runKey, user, Instant.now().toEpochMilli());
-            broadcast("vip");
-            broadcast("main");
+            broadcastStatus(qid);
+            if (qid.equals("vip")) broadcastStatus("main");
             log.info("enter : {}", user);
             log.info("입장 수 : {}", totalRunningSize());
             log.info("main 입장 수 : {}", size(RUNNING_PREFIX + "main"));
@@ -51,11 +51,11 @@ public class QueueService {
             return entered();
         }
         redis.opsForZSet().add(waitKey, user, Instant.now().toEpochMilli());
-        broadcast("vip");
-        broadcast("main");
+        broadcastStatus(qid);
+        if (qid.equals("vip")) broadcastStatus("main");
         log.info("queue " + user);
 
-        return waiting(position(waitKey, user));
+        return waiting(absolutePosition(qid, user));
     }
 
     /* ======================= 퇴장 ======================= */
@@ -71,8 +71,12 @@ public class QueueService {
         if (!waitingRemoved) redis.opsForZSet().remove(mainKey, user);
 
         promoteNextUser(qid);
-        broadcast("vip");
-        broadcast("main");
+        broadcastStatus(qid);
+        if (qid.equals("vip")) {
+            broadcastStatus("main");
+        } else if (qid.equals("main")) {
+            broadcastStatus("vip");
+        }
         log.info("leave " + user);
     }
 
@@ -96,11 +100,7 @@ public class QueueService {
     }
 
     public Map<String, Long> QueuePosition(String qid, String userId) {
-        String waitKey = WAITING_PREFIX + qid;
-
-        Long rank = redis.opsForZSet().rank(waitKey, userId);
-        // ZRANK 는 0-based, UI 에선 1-based
-        long pos = rank == null ? 0 : rank + 1;
+        long pos = absolutePosition(qid, userId);
         return Map.of("pos", pos);
     }
 
@@ -131,7 +131,7 @@ public class QueueService {
         }
     }
 
-    private void broadcast(String qid) {
+    private void broadcastStatus(String qid) {
         try {
              // 1) 현재 상태 집계
             long runningCnt   = size(RUNNING_PREFIX + qid);
@@ -196,6 +196,19 @@ public class QueueService {
     private long position(String waitKey, String user) {
         Long r = redis.opsForZSet().rank(waitKey, user);
         return r == null ? -1 : r + 1;
+    }
+
+    /** 절대 순번 계산 (main 큐는 VIP 대기열 보정) */
+    private long absolutePosition(String qid, String user) {
+        String waitKey = WAITING_PREFIX + qid;
+        long rank = position(waitKey, user);
+        if (rank < 0) return -1;
+        if ("main".equals(qid)) {
+            Long vipObj = redis.opsForZSet().size(WAITING_PREFIX + "vip");
+            long vipCnt = vipObj == null ? 0L : vipObj;
+            return vipCnt + rank;
+        }
+        return rank;
     }
 
     /* ===================== DTO ====================== */
