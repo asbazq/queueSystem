@@ -31,7 +31,7 @@ public class QueueJobService {
         redis.keys(RUNNING_PREFIX + "*").forEach(runKey -> {
             String qid = runKey.substring(RUNNING_PREFIX.length());
             String waitKey = WAITING_PREFIX + qid;
-            log.info("qid = {} waitKey = {}", qid, waitKey);
+            // log.info("qid = {} waitKey = {}", qid, waitKey);
             long cutoff = System.currentTimeMillis()
                            - QueueConfig.from(redis.opsForHash().entries("config:" + qid))
                                         .sessionTtlMillis();
@@ -40,13 +40,17 @@ public class QueueJobService {
             Set<String> expired = redis.opsForZSet().rangeByScore(runKey, 0, cutoff);
             if (expired == null || expired.isEmpty()) return;
 
+            // 세션 만료 알림
+            expired.forEach(uid ->
+                notifier.sendToUser(uid, "{\"type\":\"TIMEOUT\"}"));
+
             // 파이프라인으로 한번에 이동
             redis.executePipelined((RedisCallback<Void>) conn -> {
                 byte[] run = runKey.getBytes();
                 for (String uid : expired) {
                     byte[] m = uid.getBytes();
                     conn.zRem(run, m);
-                    log.info("user expired {} : {}", runKey, uid);
+                    // log.info("user expired {} : {}", runKey, uid);
                 }
                 return null;
             });
@@ -81,7 +85,7 @@ public class QueueJobService {
                                 conn.zRem(wait, m);
                             }
                             conn.zAdd(run, now, uid.getBytes());
-                            log.info("Promote {} -> {} ({} queue)", uid, runKey, vipBatch.contains(uid)?"vip":"main");
+                            // log.info("Promote {} -> {} ({} queue)", uid, runKey, vipBatch.contains(uid)?"vip":"main");
                         }
                         return null;
                     });

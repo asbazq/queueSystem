@@ -116,34 +116,14 @@ export default function App() {
         return;
       }
 
+       // 세션 TTL 만료 알림
+      if (msg.type === 'TIMEOUT') {
+        leave();
+        return;
+      }
+
       // 수정: 항상 서버에 내 로컬 순번을 다시 요청
       if (msg.type === 'STATUS' && msg.qid === qid) {
-        // const vipCount   = msg.waitingVip   ?? 0;
-        // const mainCount  = msg.waitingMain  ?? 0;
-        // const totalWait  = msg.waiting      ?? (vipCount + mainCount);
-
-        // 1) 대기열 카운트 갱신
-        // setWaitingVip(vipCount);
-        // setWaitingMain(mainCount);
-        // setWaiting(totalWait);
-
-        // 2) 내 로컬 순번 재조회
-        // try {
-        //   const { data } = await axios.get(
-        //     '/queue/position',
-        //     { params: { qid, userId } }
-        //   );
-        //   const localPos = data.pos ?? 0;
-        //   // 3) 메인 큐면 VIP 보정
-        //   const absPos = qid === 'main'
-        //                 ? vipCount + localPos
-        //                 : localPos;
-        //   console.log(`absPos=${absPos}`);
-        //   setPos(absPos);
-        // } catch (err) {
-        //   console.error('순번 재조회 실패', err);
-        // }
-
         setRunning(msg.running ?? 0);
         setWaitingVip(msg.waitingVip ?? 0);
         setWaitingMain(msg.waitingMain?? 0);
@@ -151,6 +131,14 @@ export default function App() {
         setPos(msg.pos ?? 0);
       }
     }
+
+    ws.onclose = () => {
+      setEntered(false);
+      setShow(false);
+      setPos(0);
+      wsRef.current = null;
+    };
+
 
     // 언마운트 시 연결 종료
     return () => ws.close();

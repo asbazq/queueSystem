@@ -44,16 +44,16 @@ public class QueueService {
             redis.opsForZSet().add(runKey, user, Instant.now().toEpochMilli());
             broadcastStatus(qid);
             if (qid.equals("vip")) broadcastStatus("main");
-            log.info("enter : {}", user);
-            log.info("입장 수 : {}", totalRunningSize());
-            log.info("main 입장 수 : {}", size(RUNNING_PREFIX + "main"));
-            log.info("vip 입장 수 : {}", size(RUNNING_PREFIX + "vip"));
+            // log.info("enter : {}", user);
+            // log.info("입장 수 : {}", totalRunningSize());
+            // log.info("main 입장 수 : {}", size(RUNNING_PREFIX + "main"));
+            // log.info("vip 입장 수 : {}", size(RUNNING_PREFIX + "vip"));
             return entered();
         }
         redis.opsForZSet().add(waitKey, user, Instant.now().toEpochMilli());
         broadcastStatus(qid);
         if (qid.equals("vip")) broadcastStatus("main");
-        log.info("queue " + user);
+        // log.info("queue " + user);
 
         return waiting(absolutePosition(qid, user));
     }
@@ -77,7 +77,7 @@ public class QueueService {
         } else if (qid.equals("main")) {
             broadcastStatus("vip");
         }
-        log.info("leave " + user);
+        // log.info("leave " + user);
     }
 
     /* =================== WS 연결 종료 =================== */
@@ -134,9 +134,9 @@ public class QueueService {
     private void broadcastStatus(String qid) {
         try {
              // 1) 현재 상태 집계
-            long runningCnt   = size(RUNNING_PREFIX + qid);
-            long vipCnt       = size(WAITING_PREFIX + "vip");
-            long mainCnt      = size(WAITING_PREFIX + "main");
+            long runningCnt = size(RUNNING_PREFIX + qid);
+            long vipCnt = size(WAITING_PREFIX + "vip");
+            long mainCnt = size(WAITING_PREFIX + "main");
             long totalWaiting = vipCnt + mainCnt;
 
             // 2) 이 큐의 대기자 리스트
@@ -198,7 +198,7 @@ public class QueueService {
         return r == null ? -1 : r + 1;
     }
 
-    /** 절대 순번 계산 (main 큐는 VIP 대기열 보정) */
+    // 절대 순번 계산 (main 큐는 VIP 대기열 보정)
     private long absolutePosition(String qid, String user) {
         String waitKey = WAITING_PREFIX + qid;
         long rank = position(waitKey, user);
