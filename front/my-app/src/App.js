@@ -18,6 +18,22 @@ export default function App() {
   const waitingRef = useRef(0);
   const wsRef      = useRef(null);
 
+    /* --------- 퇴장 함수 --------- */
+  const leave = async () => {
+    setShow(false);
+    setEntered(false);
+    setPos(0);
+    try {
+      await axios.post('/queue/leave', null, { params: { qid, userId } });
+    } catch {
+      // ignore
+    }
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+  };
+
   /* --------- 전체 상태 조회 함수 --------- */
   const fetchStatus = async () => {
     try {
@@ -166,7 +182,9 @@ export default function App() {
       </label>
 
       <button onClick={enter}>입장</button>
-
+      {entered && (
+        <button onClick={leave} style={{ marginLeft: 8 }}>접속 해제</button>
+      )}
       <hr/>
 
       <p>{entered ? '✅ 서비스 이용 중' : '⏳ 대기 중'}</p>
@@ -176,7 +194,8 @@ export default function App() {
         key={pos}
         open={show && !entered}
         position={pos}
-        onClose={() => setShow(false)}
+        // onClose={() => setShow(false)}
+        onClose={leave}
       />
     </div>
   );
