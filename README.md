@@ -164,6 +164,37 @@ curl -X POST "http://localhost:8080/admin/queue/main" \
 }
 ```
 
+#### Admin 컨트롤러(throughput, ttl 갱신)
+
+```java
+@RestController
+@RequestMapping("/admin/queue")
+@RequiredArgsConstructor
+public class QueueAdminController {
+
+    private final RedisTemplate<String, String> redis;
+
+    /** 현재 설정 조회 */
+    @GetMapping("/{qid}")
+    public QueueConfig getConfig(@PathVariable String qid) {
+        Map<Object,Object> m = redis.opsForHash().entries("config:" + qid);
+        return QueueConfig.from(m);
+    }
+
+    /** throughput, sessionTtlMillis 동시 갱신 */
+    @PostMapping("/{qid}")
+    public void updateConfig(@PathVariable String qid,
+                             @RequestParam(required = false) Integer throughput,
+                             @RequestParam(required = false) Long sessionTtlMillis) {
+        if (throughput != null) {
+            redis.opsForHash().put("config:" + qid, "throughput", throughput.toString());
+        }
+        if (sessionTtlMillis != null) {
+            redis.opsForHash().put("config:" + qid, "sessionTtlMillis", sessionTtlMillis.toString());
+        }
+    }
+```
+
 #### `broadcastStatus(qid)` (절대 pos 보정)
 
 ```java
