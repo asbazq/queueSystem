@@ -91,7 +91,7 @@ export default function App() {
     ws.onmessage = async e => {
       if (!e.data.startsWith('{')) return;
       const msg = JSON.parse(e.data);
-
+      console.log(`ws`,msg);
       // 개인 ENTER 알림
       if (msg.type === 'ENTER') {
         setEntered(true);
@@ -101,32 +101,38 @@ export default function App() {
       }
 
       // 수정: 항상 서버에 내 로컬 순번을 다시 요청
-      console.log(`type=${msg.type}, qid=${msg.qid}`)
       if (msg.type === 'STATUS' && msg.qid === qid) {
-        const vipCount   = msg.waitingVip   ?? 0;
-        const mainCount  = msg.waitingMain  ?? 0;
-        const totalWait  = msg.waiting      ?? (vipCount + mainCount);
+        // const vipCount   = msg.waitingVip   ?? 0;
+        // const mainCount  = msg.waitingMain  ?? 0;
+        // const totalWait  = msg.waiting      ?? (vipCount + mainCount);
 
         // 1) 대기열 카운트 갱신
-        setWaitingVip(vipCount);
-        setWaitingMain(mainCount);
-        setWaiting(totalWait);
+        // setWaitingVip(vipCount);
+        // setWaitingMain(mainCount);
+        // setWaiting(totalWait);
 
         // 2) 내 로컬 순번 재조회
-        try {
-          const { data } = await axios.get(
-            '/queue/position',
-            { params: { qid, userId } }
-          );
-          const localPos = data.pos ?? 0;
-          // 3) 메인 큐면 VIP 보정
-          const absPos = qid === 'main'
-                        ? vipCount + localPos
-                        : localPos;
-          setPos(absPos);
-        } catch (err) {
-          console.error('순번 재조회 실패', err);
-        }
+        // try {
+        //   const { data } = await axios.get(
+        //     '/queue/position',
+        //     { params: { qid, userId } }
+        //   );
+        //   const localPos = data.pos ?? 0;
+        //   // 3) 메인 큐면 VIP 보정
+        //   const absPos = qid === 'main'
+        //                 ? vipCount + localPos
+        //                 : localPos;
+        //   console.log(`absPos=${absPos}`);
+        //   setPos(absPos);
+        // } catch (err) {
+        //   console.error('순번 재조회 실패', err);
+        // }
+
+        setRunning(msg.running ?? 0);
+        setWaitingVip(msg.waitingVip ?? 0);
+        setWaitingMain(msg.waitingMain?? 0);
+        setWaiting(msg.waiting ?? 0);
+        setPos(msg.pos ?? 0);
       }
     }
 

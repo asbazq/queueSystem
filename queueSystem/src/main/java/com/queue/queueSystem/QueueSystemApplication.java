@@ -11,5 +11,4 @@ public class QueueSystemApplication {
 	public static void main(String[] args) {
 		SpringApplication.run(QueueSystemApplication.class, args);
 	}
-
 }

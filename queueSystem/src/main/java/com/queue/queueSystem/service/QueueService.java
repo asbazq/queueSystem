@@ -42,7 +42,8 @@ public class QueueService {
 
         if (totalRunningSize() < MAX_runnging) {
             redis.opsForZSet().add(runKey, user, Instant.now().toEpochMilli());
-            broadcast(qid);
+            broadcast("vip");
+            broadcast("main");
             log.info("enter : {}", user);
             log.info("입장 수 : {}", totalRunningSize());
             log.info("main 입장 수 : {}", size(RUNNING_PREFIX + "main"));
@@ -50,7 +51,8 @@ public class QueueService {
             return entered();
         }
         redis.opsForZSet().add(waitKey, user, Instant.now().toEpochMilli());
-        broadcast(qid);
+        broadcast("vip");
+        broadcast("main");
         log.info("queue " + user);
 
         return waiting(position(waitKey, user));
@@ -69,7 +71,8 @@ public class QueueService {
         if (!waitingRemoved) redis.opsForZSet().remove(mainKey, user);
 
         promoteNextUser(qid);
-        broadcast(qid);
+        broadcast("vip");
+        broadcast("main");
         log.info("leave " + user);
     }
 
@@ -130,17 +133,41 @@ public class QueueService {
 
     private void broadcast(String qid) {
         try {
-            // 1) 현재 상태 조회
-            QueueStatus st = status(qid);
-            // 2) JSON 오브젝트 생성
-            ObjectNode node = om.createObjectNode();
-            node.put("type", "STATUS");
-            node.put("qid", qid);
-            node.put("running",    st.running());
-            node.put("waiting",    st.waiting());
-            node.put("waitingVip", st.waitingVip());
-            node.put("waitingMain",st.waitingMain());
-            notifier.broadcast(node.toString());
+             // 1) 현재 상태 집계
+            long runningCnt   = size(RUNNING_PREFIX + qid);
+            long vipCnt       = size(WAITING_PREFIX + "vip");
+            long mainCnt      = size(WAITING_PREFIX + "main");
+            long totalWaiting = vipCnt + mainCnt;
+
+            // 2) 이 큐의 대기자 리스트
+            String waitKey = WAITING_PREFIX + qid;
+            Set<String> waiters = redis.opsForZSet().range(waitKey, 0, -1);
+            if (waiters == null) return;
+
+            // 3) 각 사용자에게 개별 STATUS+pos 전송
+            for (String uid : waiters) {
+                // ZSET 내 0-based rank → 1-based 순번
+                Long rank = redis.opsForZSet().rank(waitKey, uid);
+                long localRank = (rank == null ? 0L : rank) + 1;
+
+                // main 큐라면 VIP 수 보정
+                long pos = qid.equals("main")
+                         ? vipCnt + localRank
+                         : localRank;
+
+                // JSON 생성
+                ObjectNode node = om.createObjectNode()
+                    .put("type",        "STATUS")
+                    .put("qid",         qid)
+                    .put("running",     runningCnt)
+                    .put("waitingVip",  vipCnt)
+                    .put("waitingMain", mainCnt)
+                    .put("waiting",     totalWaiting)
+                    .put("pos",         pos);
+
+                // 개인 세션으로 전송
+                notifier.sendToUser(uid, node.toString());
+            }
         } catch (Exception e) {
             log.error("broadcast fail", e);
         }
