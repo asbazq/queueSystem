@@ -7,9 +7,9 @@ Spring Boot, Redis **대기열 시스템**
 ## 📦 주요 기능
 
 - **동시 접속자 N명 제한**: 초과 사용자는 순서 기반 대기열로 이동  
-- **Redis SET + ZSET** 활용  
-  - `active_users` (SET): 서비스 이용 중  
-  - `waiting_queue` (ZSET): 대기열 (`score = timestamp`)  
+- **Redis SET + ZSET** 활용 => **멀티 큐 확장**: `vip`, `main` 등 `qid` 파라미터로 여러 등급 큐 운영  
+  - `active_users` (SET): 서비스 이용 중  => `running:<qid>` (ZSET): 서비스 이용 중 (`score = 입장 시각`)  
+  - `waiting_queue` (ZSET): 대기열 (`score = timestamp`) => `waiting:<qid>` (ZSET): 대기열 (`score = 대기 시작 시각`)  
 - **1초 단위 자동 승격** (`waiting → running`)  
 - **세션 TTL 만료 처리** (`running → finished`)  
 - **실시간 현황 + 개인 알림** 단일 WebSocket으로 처리  
@@ -95,6 +95,9 @@ npm start
 | 대기번호 역주행           | `waiting + 1` 잘못 계산                           | waiting 감소분만 반영                     |
 | 대기번호 미갱신           | `/queue/position` API 오류/폴링 실패                | HTTP 폴링 제거, waiting diff 로컬 계산      |
 | Bean 순환 참조         | Service ↔ WebSocketHandler 상호 의존              | `QueueNotifier` 인터페이스로 단방향 참조       |
+| VIP 진입 시 Main 화면 순번 오류   | 전체 브로드캐스트(`notifier.broadcast`) 사용 | 큐별 대기자만 `sendToUser`로 브로드캐스트 변경  |
+| diff 계산 오차               | diff+REST 혼용 → race condition 발생   | WebSocket으로 **절대 pos** 푸시 방식 전환  |
+| Redis `KEYS` 명령 과부하      | 대규모 키 스캔 시 블로킹                     | 운영 시 `SCAN` 명령으로 변경              |
 
 ---
 
@@ -126,8 +129,83 @@ curl http://localhost:8080/admin/queue/main
 curl -X POST "http://localhost:8080/admin/queue/main" \
      -d "throughput=50&sessionTtlMillis=1800000"
 ```
+### 3) 멀티 큐 지원 추가(완료)
+
+#### Redis 키 네이밍
+
+| 큐 ID(qid) | 실행중 (ZSET)     | 대기열 (ZSET)     |
+| --------- | -------------- | -------------- |
+| `vip`     | `running:vip`  | `waiting:vip`  |
+| `main`    | `running:main` | `waiting:main` |
 
 ---
+
+#### REST 컨트롤러
+
+```java
+@RestController @RequiredArgsConstructor
+@RequestMapping("/queue")
+public class QueueController {
+  @PostMapping("/enter")
+  public QueueResponse enter(@RequestParam String qid, @RequestParam String userId) {
+    return svc.enter(qid,userId);
+  }
+
+  @GetMapping("/position")
+  public Map<String,Long> position(@RequestParam String qid,@RequestParam String userId) {
+    return svc.QueuePosition(qid,userId);
+  }
+
+  @GetMapping("/status")
+  public QueueStatus status(@RequestParam String qid) {
+    return svc.status(qid);
+  }
+}
+```
+
+#### `broadcastStatus(qid)` (절대 pos 보정)
+
+```java
+private void broadcastStatus(String qid) {
+  long runningCnt   = size("running:"+qid);
+  long vipCnt       = size("waiting:vip");
+  long mainCnt      = size("waiting:main");
+  long totalWaiting = vipCnt + mainCnt;
+
+  String waitKey = "waiting:"+qid;
+  for (String uid : redis.opsForZSet().range(waitKey,0,-1)) {
+    long rank      = redis.opsForZSet().rank(waitKey,uid)+1;
+    long pos       = qid.equals("main") ? vipCnt + rank : rank;
+
+    ObjectNode msg = om.createObjectNode()
+      .put("type","STATUS")
+      .put("qid", qid)
+      .put("running", runningCnt)
+      .put("waitingVip", vipCnt)
+      .put("waitingMain", mainCnt)
+      .put("waiting", totalWaiting)
+      .put("pos", pos);
+
+    notifier.sendToUser(uid, msg.toString());
+  }
+}
+```
+
+#### React 클라이언트 처리
+
+```jsx
+ws.onmessage = e => {
+  const msg = JSON.parse(e.data);
+  if (msg.type==='STATUS' && msg.qid===qid) {
+    setRunning(msg.running);
+    setWaitingVip(msg.waitingVip);
+    setWaitingMain(msg.waitingMain);
+    setWaiting(msg.waitingVip + msg.waitingMain);
+    setPos(msg.pos);
+  }
+};
+```
+
 
 ## 📖 참고 자료
 
