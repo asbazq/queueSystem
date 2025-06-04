@@ -53,7 +53,7 @@ public class QueueService {
         broadcast(qid);
         log.info("queue " + user);
 
-        return waiting(position(waitKey, user));
+        return waiting(absolutePosition(qid, user));
     }
 
     /* ======================= 퇴장 ======================= */
@@ -93,11 +93,7 @@ public class QueueService {
     }
 
     public Map<String, Long> QueuePosition(String qid, String userId) {
-        String waitKey = WAITING_PREFIX + qid;
-
-        Long rank = redis.opsForZSet().rank(waitKey, userId);
-        // ZRANK 는 0-based, UI 에선 1-based
-        long pos = rank == null ? 0 : rank + 1;
+        long pos = absolutePosition(qid, userId);
         return Map.of("pos", pos);
     }
 
@@ -169,6 +165,19 @@ public class QueueService {
     private long position(String waitKey, String user) {
         Long r = redis.opsForZSet().rank(waitKey, user);
         return r == null ? -1 : r + 1;
+    }
+
+    /** 절대 순번 계산 (main 큐는 VIP 대기열 보정) */
+    private long absolutePosition(String qid, String user) {
+        String waitKey = WAITING_PREFIX + qid;
+        long rank = position(waitKey, user);
+        if (rank < 0) return -1;
+        if ("main".equals(qid)) {
+            Long vipObj = redis.opsForZSet().size(WAITING_PREFIX + "vip");
+            long vipCnt = vipObj == null ? 0L : vipObj;
+            return vipCnt + rank;
+        }
+        return rank;
     }
 
     /* ===================== DTO ====================== */

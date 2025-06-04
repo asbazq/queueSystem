@@ -6,6 +6,8 @@ import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import com.queue.queueSystem.security.QueueConfig;
 
@@ -19,6 +21,7 @@ public class QueueJobService {
 
     private final RedisTemplate<String, String> redis;
     private final QueueNotifier notifier;
+    private final ObjectMapper om = new ObjectMapper();
 
     private static final String WAITING_PREFIX = "waiting:";
     private static final String RUNNING_PREFIX = "running:";
@@ -83,28 +86,43 @@ public class QueueJobService {
                         return null;
                     });
                     promote.forEach(uid -> notifier.sendToUser(uid, "{\"type\":\"ENTER\"}"));
-            }
-            // 만료 후 전체 현황만 브로드캐스트
-            long runningCnt = redis.opsForZSet().size(runKey);
-            long vipCnt = redis.opsForZSet().size(WAITING_PREFIX + "vip");
-            long mainCnt = redis.opsForZSet().size(WAITING_PREFIX + "main");
-            long totalWaiting = vipCnt + mainCnt;
-
-            Set<String> waiters = redis.opsForZSet().range(waitKey, 0, -1);
-            if (waiters != null) {
-                for (String uid : waiters) {
-                    Long rank = redis.opsForZSet().rank(waitKey, uid);
-                    long pos = (rank == null ? 0L : rank + 1);
-                    String msg = String.format(
-                    "{\"type\":\"STATUS\",\"qid\":\"%s\"," +
-                    "\"running\":%d,\"waitingVip\":%d,\"waitingMain\":%d," +
-                    "\"waiting\":%d,\"pos\":%d}",
-                    qid, runningCnt, vipCnt, mainCnt, totalWaiting, pos
-                    );
-                    notifier.sendToUser(uid, msg);
-                }
+                    // Promote 이후 각 큐의 상태 갱신
+                    broadcastStatus("vip");
+                    broadcastStatus("main");
             }
         });
+    }
+
+    /** 각 큐의 대기자에게 최신 STATUS 메시지를 전달 */
+    private void broadcastStatus(String qid) {
+        long runningCnt   = size(RUNNING_PREFIX + qid);
+        long vipCnt       = size(WAITING_PREFIX + "vip");
+        long mainCnt      = size(WAITING_PREFIX + "main");
+        long totalWaiting = vipCnt + mainCnt;
+
+        String waitKey = WAITING_PREFIX + qid;
+        Set<String> waiters = redis.opsForZSet().range(waitKey, 0, -1);
+        if (waiters == null) return;
+        for (String uid : waiters) {
+            Long rankObj = redis.opsForZSet().rank(waitKey, uid);
+            long rank = rankObj == null ? 0L : rankObj + 1;
+            long pos = qid.equals("main") ? vipCnt + rank : rank;
+
+            ObjectNode msg = om.createObjectNode()
+                    .put("type", "STATUS")
+                    .put("qid", qid)
+                    .put("running", runningCnt)
+                    .put("waitingVip", vipCnt)
+                    .put("waitingMain", mainCnt)
+                    .put("waiting", totalWaiting)
+                    .put("pos", pos);
+            notifier.sendToUser(uid, msg.toString());
+        }
+    }
+
+    private long size(String key) {
+        Long v = redis.opsForZSet().size(key);
+        return v == null ? 0L : v;
     }
 
     private String statusJson(String qid) {
