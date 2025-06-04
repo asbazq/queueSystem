@@ -144,23 +144,23 @@ curl -X POST "http://localhost:8080/admin/queue/main" \
 #### REST 컨트롤러
 
 ```java
-@RestController @RequiredArgsConstructor
-@RequestMapping("/queue")
-public class QueueController {
-  @PostMapping("/enter")
-  public QueueResponse enter(@RequestParam String qid, @RequestParam String userId) {
-    return svc.enter(qid,userId);
-  }
+    @PostMapping("/enter")
+    public QueueService.QueueResponse enter(@RequestParam String qid, @RequestParam("userId") String userId) {
+        return svc.enter(qid, userId);
+    }
 
-  @GetMapping("/position")
-  public Map<String,Long> position(@RequestParam String qid,@RequestParam String userId) {
-    return svc.QueuePosition(qid,userId);
-  }
+    @PostMapping("/leave")
+    public void leave(@RequestParam String qid, @RequestParam("userId") String userId) {
+        svc.leave(qid, userId);
+    }
 
-  @GetMapping("/status")
-  public QueueStatus status(@RequestParam String qid) {
-    return svc.status(qid);
-  }
+    @GetMapping("/status")
+    public QueueService.QueueStatus status(@RequestParam String qid) { return svc.status(qid); }
+
+    @GetMapping("/position")
+    public Map<String, Long> QueuePosition(@RequestParam String qid, @RequestParam("userId") String userId) {
+        return svc.QueuePosition(qid, userId);
+    }
 }
 ```
 
