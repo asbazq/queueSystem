@@ -167,29 +167,47 @@ public class QueueController {
 #### `broadcastStatus(qid)` (절대 pos 보정)
 
 ```java
-private void broadcastStatus(String qid) {
-  long runningCnt   = size("running:"+qid);
-  long vipCnt       = size("waiting:vip");
-  long mainCnt      = size("waiting:main");
-  long totalWaiting = vipCnt + mainCnt;
+ private void broadcastStatus(String qid) {
+        try {
+             // 1) 현재 상태 집계
+            long runningCnt = size(RUNNING_PREFIX + qid);
+            long vipCnt = size(WAITING_PREFIX + "vip");
+            long mainCnt = size(WAITING_PREFIX + "main");
+            long totalWaiting = vipCnt + mainCnt;
 
-  String waitKey = "waiting:"+qid;
-  for (String uid : redis.opsForZSet().range(waitKey,0,-1)) {
-    long rank      = redis.opsForZSet().rank(waitKey,uid)+1;
-    long pos       = qid.equals("main") ? vipCnt + rank : rank;
+            // 2) 이 큐의 대기자 리스트
+            String waitKey = WAITING_PREFIX + qid;
+            Set<String> waiters = redis.opsForZSet().range(waitKey, 0, -1);
+            if (waiters == null) return;
 
-    ObjectNode msg = om.createObjectNode()
-      .put("type","STATUS")
-      .put("qid", qid)
-      .put("running", runningCnt)
-      .put("waitingVip", vipCnt)
-      .put("waitingMain", mainCnt)
-      .put("waiting", totalWaiting)
-      .put("pos", pos);
+            // 3) 각 사용자에게 개별 STATUS+pos 전송
+            for (String uid : waiters) {
+                // ZSET 내 0-based rank → 1-based 순번
+                Long rank = redis.opsForZSet().rank(waitKey, uid);
+                long localRank = (rank == null ? 0L : rank) + 1;
 
-    notifier.sendToUser(uid, msg.toString());
-  }
-}
+                // main 큐라면 VIP 수 보정
+                long pos = qid.equals("main")
+                         ? vipCnt + localRank
+                         : localRank;
+
+                // JSON 생성
+                ObjectNode node = om.createObjectNode()
+                    .put("type",        "STATUS")
+                    .put("qid",         qid)
+                    .put("running",     runningCnt)
+                    .put("waitingVip",  vipCnt)
+                    .put("waitingMain", mainCnt)
+                    .put("waiting",     totalWaiting)
+                    .put("pos",         pos);
+
+                // 개인 세션으로 전송
+                notifier.sendToUser(uid, node.toString());
+            }
+        } catch (Exception e) {
+            log.error("broadcast fail", e);
+        }
+    }
 ```
 
 #### React 클라이언트 처리
