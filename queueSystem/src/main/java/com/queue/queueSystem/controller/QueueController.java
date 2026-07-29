@@ -13,6 +13,7 @@ import org.springframework.http.HttpStatus;
 import com.queue.queueSystem.service.QueueService;
 import com.queue.queueSystem.service.QueueService.QueueResponse;
 import com.queue.queueSystem.service.QueueService.QueueStatus;
+import com.queue.queueSystem.service.QueueValidator;
 
 import lombok.RequiredArgsConstructor;
 
@@ -22,6 +23,7 @@ import lombok.RequiredArgsConstructor;
 public class QueueController {
 
     private final QueueService queueService;
+    private final QueueValidator validator;
 
     @PostMapping("/enter")
     public QueueResponse enter(@RequestParam String group,
@@ -62,17 +64,17 @@ public class QueueController {
     }
 
     private void validateQueueParams(String group, String qid, String userId) {
-        validateGroup(group);
-        if (!"vip".equals(qid) && !"main".equals(qid)) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unsupported qid");
-        }
-        if (userId == null || userId.isBlank()) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "userId is required");
+        try {
+            validator.validate(group, qid, userId);
+        } catch (IllegalArgumentException ex) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, ex.getMessage());
         }
     }
 
     private void validateGroup(String group) {
-        if (!"site".equals(group) && !"predict".equals(group)) {
+        try {
+            validator.validateGroup(group);
+        } catch (IllegalArgumentException ex) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unsupported group");
         }
     }

@@ -2,6 +2,8 @@ package com.queue.queueSystem;
 
 import com.queue.queueSystem.service.QueueNotifier;
 import com.queue.queueSystem.service.QueueService;
+import com.queue.queueSystem.service.QueueStatusPublisher;
+import com.queue.queueSystem.service.QueueValidator;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -23,7 +25,8 @@ class QueueServiceTest {
         Mockito.when(zset.size("waiting:{site}:main")).thenReturn(4L);
 
         QueueNotifier notifier = Mockito.mock(QueueNotifier.class);
-        QueueService svc = new QueueService(redis, notifier);
+        QueueService svc = new QueueService(
+            redis, notifier, Mockito.mock(QueueStatusPublisher.class), new QueueValidator());
 
         QueueService.QueueStatus st = svc.status("site");
         assertEquals(3L, st.running());

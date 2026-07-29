@@ -2,6 +2,7 @@ package com.queue.queueSystem;
 
 import com.queue.queueSystem.service.QueueJobService;
 import com.queue.queueSystem.service.QueueNotifier;
+import com.queue.queueSystem.service.QueueStatusPublisher;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -20,7 +21,8 @@ class QueueJobServiceTest {
         Mockito.when(zset.size("running:test")).thenReturn(null);
 
         QueueNotifier notifier = Mockito.mock(QueueNotifier.class);
-        QueueJobService job = new QueueJobService(redis, notifier);
+        QueueJobService job = new QueueJobService(
+            redis, notifier, Mockito.mock(QueueStatusPublisher.class));
 
         long res = ReflectionTestUtils.invokeMethod(job, "size", "running:test");
         assertEquals(0L, res);

@@ -2,7 +2,6 @@ package com.queue.queueSystem.service;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 
 import org.springframework.context.annotation.Profile;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -12,8 +11,6 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import com.queue.queueSystem.security.QueueConfig;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,7 +27,7 @@ public class QueueJobService {
 
     private final RedisTemplate<String, String> redis;
     private final QueueNotifier notifier;
-    private final ObjectMapper om = new ObjectMapper();
+    private final QueueStatusPublisher statusPublisher;
 
     private static final String LUA_EXPIRE_AND_PROMOTE_WITH_CAP = """
     -- KEYS: 1 vipRunKey, 2 mainRunKey, 3 targetRunKey, 4 vipWaitKey, 5 mainWaitKey, 6 configKey
@@ -82,9 +79,11 @@ public class QueueJobService {
         primaryWait, secondaryWait = mainWaitKey, vipWaitKey
       end
 
-      local popped = redis.call('ZPOPMIN', primaryWait, 1)
+      local selectedWait = primaryWait
+      local popped = redis.call('ZPOPMIN', selectedWait, 1)
       if (not popped) or (#popped == 0) then
-        popped = redis.call('ZPOPMIN', secondaryWait, 1)
+        selectedWait = secondaryWait
+        popped = redis.call('ZPOPMIN', selectedWait, 1)
       end
 
       if not popped or #popped == 0 then
@@ -93,10 +92,11 @@ public class QueueJobService {
 
       local uid = popped[1]
       table.insert(promoted, uid)
-      redis.call('ZADD', targetRunKey, nowMs, uid)
+      local destinationRunKey = (selectedWait == vipWaitKey) and vipRunKey or mainRunKey
+      redis.call('ZADD', destinationRunKey, nowMs, uid)
 
       if targetRunKey == vipRunKey then
-        if primaryWait == vipWaitKey then
+        if selectedWait == vipWaitKey then
           redis.call('HINCRBY', configKey, 'vip_streak', 1)
         else
           redis.call('HSET', configKey, 'vip_streak', 0)
@@ -125,29 +125,26 @@ public class QueueJobService {
     @Scheduled(fixedRate = 10_000, initialDelayString = "20000")
     public void expire() {
         long now = System.currentTimeMillis();
-
-        processOne(now, "site", "vip");
-        processOne(now, "site", "main");
-        broadcastStatus("site", "vip");
-        broadcastStatus("site", "main");
-
-        processOne(now, "predict", "vip");
-        processOne(now, "predict", "main");
-        broadcastStatus("predict", "vip");
-        broadcastStatus("predict", "main");
-    }
-
-    private void processOne(long now, String group, String qid) {
         var siteMap = redis.opsForHash().entries("config:{site}");
         var predictMap = redis.opsForHash().entries("config:{predict}");
-        QueueConfig cfg = QueueConfig.from(siteMap, predictMap);
+        QueueConfig config = QueueConfig.from(siteMap, predictMap);
 
-        long ttl = "site".equals(group) ? cfg.sessionTtlMillisSite() : cfg.sessionTtlMillisPredict();
+        processOne(now, "site", "vip", config);
+        processOne(now, "site", "main", config);
+        statusPublisher.publish("site");
+
+        processOne(now, "predict", "vip", config);
+        processOne(now, "predict", "main", config);
+        statusPublisher.publish("predict");
+    }
+
+    private void processOne(long now, String group, String qid, QueueConfig config) {
+        long ttl = "site".equals(group) ? config.sessionTtlMillisSite() : config.sessionTtlMillisPredict();
         if (ttl <= 0) {
             return;
         }
 
-        int fallbackMax = "site".equals(group) ? cfg.maxRunningSite() : cfg.maxRunningPredict();
+        int fallbackMax = "site".equals(group) ? config.maxRunningSite() : config.maxRunningPredict();
         if (fallbackMax < 1) {
             fallbackMax = 1;
         }
@@ -191,37 +188,6 @@ public class QueueJobService {
         }
         for (String uid : promoted) {
             notifier.sendToUser(group, uid, "{\"type\":\"ENTER\"}");
-        }
-    }
-
-    private void broadcastStatus(String group, String qid) {
-        long runningCnt = size(RUNNING_PREFIX + "{" + group + "}:" + qid);
-        long vipCnt = size(WAITING_PREFIX + "{" + group + "}:vip");
-        long mainCnt = size(WAITING_PREFIX + "{" + group + "}:main");
-        long totalWaiting = vipCnt + mainCnt;
-
-        String waitKey = WAITING_PREFIX + "{" + group + "}:" + qid;
-        Set<String> waiters = redis.opsForZSet().range(waitKey, 0, -1);
-        if (waiters == null) {
-            return;
-        }
-
-        for (String uid : waiters) {
-            Long rankObj = redis.opsForZSet().rank(waitKey, uid);
-            long rank = rankObj == null ? 0L : rankObj + 1;
-            long pos = "main".equals(qid) ? vipCnt + rank : rank;
-
-            ObjectNode msg = om.createObjectNode()
-                .put("type", "STATUS")
-                .put("group", group)
-                .put("qid", qid)
-                .put("running", runningCnt)
-                .put("waitingVip", vipCnt)
-                .put("waitingMain", mainCnt)
-                .put("waiting", totalWaiting)
-                .put("pos", pos);
-
-            notifier.sendToUser(group, uid, msg.toString());
         }
     }
 

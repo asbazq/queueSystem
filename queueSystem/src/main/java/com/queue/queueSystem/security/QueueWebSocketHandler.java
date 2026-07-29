@@ -9,9 +9,11 @@ import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
+import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import com.queue.queueSystem.service.QueueNotifier;
+import com.queue.queueSystem.service.QueueValidator;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -20,10 +22,12 @@ import lombok.extern.slf4j.Slf4j;
 public class QueueWebSocketHandler extends TextWebSocketHandler implements QueueNotifier {
 
     private final ApplicationEventPublisher publisher;
+    private final QueueValidator validator;
     private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
 
-    public QueueWebSocketHandler(ApplicationEventPublisher publisher) {
+    public QueueWebSocketHandler(ApplicationEventPublisher publisher, QueueValidator validator) {
         this.publisher = publisher;
+        this.validator = validator;
     }
 
     @Override
@@ -36,9 +40,18 @@ public class QueueWebSocketHandler extends TextWebSocketHandler implements Queue
         String group = qs.getFirst("group");
         String qid = qs.getFirst("qid");
         String userId = qs.getFirst("userId");
+        if (!validator.isValid(group, qid, userId)) {
+            try {
+                session.close(CloseStatus.BAD_DATA.withReason("Invalid queue parameters"));
+            } catch (Exception ex) {
+                log.debug("Failed to close invalid WebSocket session {}", session.getId(), ex);
+            }
+            return;
+        }
 
         String key = userKey(group, userId);
-        WebSocketSession old = sessions.put(key, session);
+        WebSocketSession safeSession = new ConcurrentWebSocketSessionDecorator(session, 10_000, 64 * 1024);
+        WebSocketSession old = sessions.put(key, safeSession);
         if (old != null && old.isOpen()) {
             try {
                 old.close(CloseStatus.NORMAL);
@@ -60,7 +73,13 @@ public class QueueWebSocketHandler extends TextWebSocketHandler implements Queue
             group = qs.getFirst("group");
             qid = qs.getFirst("qid");
             userId = qs.getFirst("userId");
-            removedCurrentSession = sessions.remove(userKey(group, userId), session);
+            WebSocketSession current = sessions.get(userKey(group, userId));
+            if (current instanceof ConcurrentWebSocketSessionDecorator decorated
+                && decorated.getDelegate().equals(session)) {
+                removedCurrentSession = sessions.remove(userKey(group, userId), current);
+            } else {
+                removedCurrentSession = sessions.remove(userKey(group, userId), session);
+            }
         } else {
             removedCurrentSession = sessions.entrySet().removeIf(entry -> entry.getValue().equals(session));
         }
@@ -73,9 +92,8 @@ public class QueueWebSocketHandler extends TextWebSocketHandler implements Queue
             removedCurrentSession
         );
 
-        if (removedCurrentSession) {
-            publisher.publishEvent(new UserDisconnectedEvent(group, qid, userId));
-        }
+        // A socket close is transient. Redis membership is removed only by explicit
+        // POST /queue/leave or heartbeat TTL expiry.
     }
 
     @Override
@@ -105,6 +123,9 @@ public class QueueWebSocketHandler extends TextWebSocketHandler implements Queue
     }
 
     private void sendSilently(WebSocketSession session, String message) {
+        if (session == null || !session.isOpen()) {
+            return;
+        }
         try {
             session.sendMessage(new TextMessage(message));
         } catch (Exception ex) {

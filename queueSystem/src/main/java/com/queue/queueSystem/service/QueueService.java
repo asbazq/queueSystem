@@ -3,7 +3,6 @@ package com.queue.queueSystem.service;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 import org.springframework.context.event.EventListener;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -11,10 +10,7 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
-import com.queue.queueSystem.security.UserDisconnectedEvent;
 import com.queue.queueSystem.security.UserPingEvent;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -24,24 +20,24 @@ public class QueueService {
 
     private final RedisTemplate<String, String> redis;
     private final QueueNotifier notifier;
+    private final QueueStatusPublisher statusPublisher;
+    private final QueueValidator validator;
 
     private static final String RUNNING_PREFIX = "running:";
     private static final String WAITING_PREFIX = "waiting:";
     public static final long VIP_PRIORITY_BONUS = 3_000_000L;
     private static final int VIP_STREAK_LIMIT = 3;
 
-    private final ObjectMapper om = new ObjectMapper();
-
-    public QueueService(RedisTemplate<String, String> redis, QueueNotifier notifier) {
+    public QueueService(RedisTemplate<String, String> redis, QueueNotifier notifier,
+                        QueueStatusPublisher statusPublisher, QueueValidator validator) {
         this.redis = redis;
         this.notifier = notifier;
+        this.statusPublisher = statusPublisher;
+        this.validator = validator;
     }
 
     public QueueResponse enter(String group, String qid, String user) {
-        validateGroupAndQid(group, qid);
-        if (user == null || user.isBlank()) {
-            throw new IllegalArgumentException("userId is required");
-        }
+        validator.validate(group, qid, user);
 
         final String vipRun = runKey(group, "vip");
         final String mainRun = runKey(group, "main");
@@ -67,8 +63,7 @@ public class QueueService {
         );
 
         if (res == null || res.size() < 2) {
-            broadcastStatus(group, "vip");
-            broadcastStatus(group, "main");
+            statusPublisher.publish(group);
             return waiting(-1);
         }
 
@@ -79,13 +74,12 @@ public class QueueService {
         } catch (Exception ignore) {
         }
 
-        broadcastStatus(group, "vip");
-        broadcastStatus(group, "main");
+        statusPublisher.publish(group);
         return "entered".equals(state) ? entered() : waiting(pos);
     }
 
     public void leave(String group, String qid, String user) {
-        validateGroupAndQid(group, qid);
+        validator.validate(group, qid, user);
         if (user == null || user.isBlank()) {
             return;
         }
@@ -102,12 +96,11 @@ public class QueueService {
             promoteNextUser(group, "main");
         }
 
-        broadcastStatus(group, "vip");
-        broadcastStatus(group, "main");
+        statusPublisher.publish(group);
     }
 
     public void touch(String group, String qid, String user) {
-        validateGroupAndQid(group, qid);
+        validator.validate(group, qid, user);
         if (user == null || user.isBlank()) {
             return;
         }
@@ -122,15 +115,8 @@ public class QueueService {
         touch(ev.group(), ev.qid(), ev.userId());
     }
 
-    @EventListener
-    public void onWebsocketDisconnected(UserDisconnectedEvent ev) {
-        if (ev.userId() != null) {
-            leave(ev.group(), ev.qid(), ev.userId());
-        }
-    }
-
     public QueueStatus status(String group) {
-        validateGroup(group);
+        validator.validateGroup(group);
         long runSize = size(runKey(group, "vip")) + size(runKey(group, "main"));
         long vipWait = size(waitKey(group, "vip"));
         long mainWait = size(waitKey(group, "main"));
@@ -139,12 +125,12 @@ public class QueueService {
     }
 
     public Map<String, Long> queuePosition(String group, String qid, String userId) {
-        validateGroupAndQid(group, qid);
+        validator.validate(group, qid, userId);
         return Map.of("pos", absolutePosition(group, qid, userId));
     }
 
     public Map<String, Object> isRunning(String group, String qid, String userId) {
-        validateGroupAndQid(group, qid);
+        validator.validate(group, qid, userId);
         boolean running = isRunningInAnyQueue(group, userId);
         long pos = running ? 0L : absolutePosition(group, qid, userId);
         return Map.of("running", running, "pos", pos);
@@ -195,19 +181,22 @@ public class QueueService {
       primaryWait, secondaryWait = mainWaitKey, vipWaitKey
     end
 
-    local popped = redis.call('ZPOPMIN', primaryWait, 1)
+    local selectedWait = primaryWait
+    local popped = redis.call('ZPOPMIN', selectedWait, 1)
     if (not popped) or (#popped == 0) then
-      popped = redis.call('ZPOPMIN', secondaryWait, 1)
+      selectedWait = secondaryWait
+      popped = redis.call('ZPOPMIN', selectedWait, 1)
     end
     if not popped or #popped == 0 then
       return nil
     end
 
     local uid = popped[1]
-    redis.call('ZADD', targetRunKey, nowMs, uid)
+    local destinationRunKey = (selectedWait == vipWaitKey) and vipRunKey or mainRunKey
+    redis.call('ZADD', destinationRunKey, nowMs, uid)
 
     if targetRunKey == vipRunKey then
-      if primaryWait == vipWaitKey then
+      if selectedWait == vipWaitKey then
         redis.call('HINCRBY', configKey, 'vip_streak', 1)
       else
         redis.call('HSET', configKey, 'vip_streak', 0)
@@ -317,41 +306,6 @@ public class QueueService {
         }
     }
 
-    private void broadcastStatus(String group, String qid) {
-        try {
-            long runningCnt = size(runKey(group, qid));
-            long vipCnt = size(waitKey(group, "vip"));
-            long mainCnt = size(waitKey(group, "main"));
-            long totalWaiting = vipCnt + mainCnt;
-
-            String waitKey = waitKey(group, qid);
-            Set<String> waiters = redis.opsForZSet().range(waitKey, 0, -1);
-            if (waiters == null) {
-                return;
-            }
-
-            for (String uid : waiters) {
-                Long rank = redis.opsForZSet().rank(waitKey, uid);
-                long localRank = (rank == null ? 0L : rank) + 1;
-                long pos = "main".equals(qid) ? vipCnt + localRank : localRank;
-
-                ObjectNode node = om.createObjectNode()
-                    .put("type", "STATUS")
-                    .put("group", group)
-                    .put("qid", qid)
-                    .put("running", runningCnt)
-                    .put("waitingVip", vipCnt)
-                    .put("waitingMain", mainCnt)
-                    .put("waiting", totalWaiting)
-                    .put("pos", pos);
-
-                notifier.sendToUser(group, uid, node.toString());
-            }
-        } catch (Exception e) {
-            log.error("broadcast fail", e);
-        }
-    }
-
     private boolean removeFromZSet(String key, String user) {
         Long removed = redis.opsForZSet().remove(key, user);
         return removed != null && removed > 0;
@@ -391,33 +345,20 @@ public class QueueService {
         return rank;
     }
 
-    private void validateGroupAndQid(String group, String qid) {
-        validateGroup(group);
-        if (!"vip".equals(qid) && !"main".equals(qid)) {
-            throw new IllegalArgumentException("Unsupported qid: " + qid);
-        }
-    }
-
-    private void validateGroup(String group) {
-        if (!"site".equals(group) && !"predict".equals(group)) {
-            throw new IllegalArgumentException("Unsupported group: " + group);
-        }
-    }
-
     private static String slot(String group) {
         return (group == null || group.isBlank()) ? "" : "{" + group + "}:";
     }
 
     private static String runKey(String group, String qid) {
-        return RUNNING_PREFIX + slot(group) + qid;
+        return QueueKeys.running(group, qid);
     }
 
     private static String waitKey(String group, String qid) {
-        return WAITING_PREFIX + slot(group) + qid;
+        return QueueKeys.waiting(group, qid);
     }
 
     private static String cfgKey(String group) {
-        return "config:" + slot(group).replace(":{", "{");
+        return QueueKeys.config(group);
     }
 
     public record QueueStatus(long running, long waiting, long waitingVip, long waitingMain) {}

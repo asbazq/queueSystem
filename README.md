@@ -10,9 +10,12 @@ YuGiOhDeck에서 운영 중인 대기열 구현을 독립 프로젝트에 동기
 - `vip`, `main` 대기열과 전체 Running 정원 통합 관리
 - Redis Lua 스크립트로 입장 및 승급을 원자적으로 처리
 - WebSocket 세션을 `group + userId` 기준으로 관리하고 중복 연결 교체
+- WebSocket 종료는 일시 장애로 간주하며, 명시적 `/queue/leave` 또는 heartbeat TTL 만료 때만 Redis에서 제거
+- WebSocket 연결 파라미터 검증 및 동시 전송 보호
 - 5초 heartbeat와 그룹별 세션 TTL 만료 처리
 - Running 이탈·만료 시 Waiting 사용자를 즉시 승급
-- 대기 순번을 Redis `ZRANK` 기준 `STATUS` 메시지로 사용자별 전송
+- Redis 정렬 결과의 인덱스로 순번을 계산해 사용자별 `STATUS` 메시지 전송
+- `STATUS.running`은 전체 Running이며 `runningVip`, `runningMain`을 함께 제공
 - REST API의 `group`, `qid`, `userId` 입력값 검증
 - 관리자 API에서 그룹별 `throughput`, `sessionTtlMillis`, `maxRunning` 설정 지원
 - React 데모가 현재 호스트의 WebSocket을 사용하고 heartbeat를 전송하도록 변경
@@ -60,7 +63,7 @@ flowchart LR
     ADM[QueueAdminController]
   end
   QS -- push/broadcast --> WSH
-  WSH -- disconnect 이벤트 --> QS
+  WSH -- heartbeat 이벤트 --> QS
   JOB -- ZPOPMIN/ZRANGEBYSCORE --> Redis[(SET + ZSET)]
   ADM -- HSET config --> Redis
   QS -- SCARD/ZCARD --> Redis
@@ -119,7 +122,7 @@ npm start
 | 증상                 | 원인                                            | 해결                                  |
 | ------------------ | --------------------------------------------- | ----------------------------------- |
 | WRONGTYPE Redis 오류 | ZSET 키를 SET API로 조회                           | `opsForZSet().size()` 사용            |
-| 입장 직후 즉시 퇴장        | React Strict-Mode 더블 언마운트, client `/leave` 호출 | 클라이언트 `/leave` 제거, WS close 이벤트로 처리 |
+| 입장 직후 즉시 퇴장        | React Strict-Mode 더블 언마운트, WebSocket 재연결 | WS close에서는 제거하지 않고 heartbeat TTL로 처리 |
 | 대기번호 역주행           | `waiting + 1` 잘못 계산                           | waiting 감소분만 반영                     |
 | 대기번호 미갱신           | `/queue/position` API 오류/폴링 실패                | HTTP 폴링 제거, waiting diff 로컬 계산      |
 | Bean 순환 참조         | Service ↔ WebSocketHandler 상호 의존              | `QueueNotifier` 인터페이스로 단방향 참조       |
