@@ -1,17 +1,22 @@
 package com.queue.queueSystem.service;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.queue.queueSystem.security.UserDisconnectedEvent;
-
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.context.event.EventListener;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.stereotype.Service;
-
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
+import org.springframework.context.event.EventListener;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.stereotype.Service;
+
+import com.queue.queueSystem.security.UserDisconnectedEvent;
+import com.queue.queueSystem.security.UserPingEvent;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import lombok.extern.slf4j.Slf4j;
 
 @Service
 @Slf4j
@@ -22,175 +27,350 @@ public class QueueService {
 
     private static final String RUNNING_PREFIX = "running:";
     private static final String WAITING_PREFIX = "waiting:";
-    private static final int    MAX_runnging = 2;
+    public static final long VIP_PRIORITY_BONUS = 3_000_000L;
+    private static final int VIP_STREAK_LIMIT = 3;
 
     private final ObjectMapper om = new ObjectMapper();
 
-    public QueueService(RedisTemplate<String, String> redis,
-                        QueueNotifier notifier) {
-        this.redis    = redis;
+    public QueueService(RedisTemplate<String, String> redis, QueueNotifier notifier) {
+        this.redis = redis;
         this.notifier = notifier;
     }
 
-    /* ======================= 입장 ======================= */
-    public QueueResponse enter(String qid, String user) {
-        String runKey  = RUNNING_PREFIX + qid;
-        String waitKey = WAITING_PREFIX + qid;
-        
-        if (redis.opsForZSet().score(runKey, user) != null)
-            return entered();
-
-        if (totalRunningSize() < MAX_runnging) {
-            redis.opsForZSet().add(runKey, user, Instant.now().toEpochMilli());
-            broadcastStatus(qid);
-            if (qid.equals("vip")) broadcastStatus("main");
-            // log.info("enter : {}", user);
-            // log.info("입장 수 : {}", totalRunningSize());
-            // log.info("main 입장 수 : {}", size(RUNNING_PREFIX + "main"));
-            // log.info("vip 입장 수 : {}", size(RUNNING_PREFIX + "vip"));
-            return entered();
+    public QueueResponse enter(String group, String qid, String user) {
+        validateGroupAndQid(group, qid);
+        if (user == null || user.isBlank()) {
+            throw new IllegalArgumentException("userId is required");
         }
-        redis.opsForZSet().add(waitKey, user, Instant.now().toEpochMilli());
-        broadcastStatus(qid);
-        if (qid.equals("vip")) broadcastStatus("main");
-        // log.info("queue " + user);
 
-        return waiting(absolutePosition(qid, user));
-    }
+        final String vipRun = runKey(group, "vip");
+        final String mainRun = runKey(group, "main");
+        final String targetRun = runKey(group, qid);
+        final String vipWait = waitKey(group, "vip");
+        final String mainWait = waitKey(group, "main");
+        final String cfgKey = cfgKey(group);
+        final String seqKey = "seq:{" + group + "}";
 
-    /* ======================= 퇴장 ======================= */
-    public void leave(String qid, String user) {
-        if (user == null || user.isBlank()) return;
+        long now = System.currentTimeMillis();
+        int fallbackMax = Math.max(1, maxRunning(group));
+        boolean isVip = "vip".equals(qid);
 
-        String runKey  = RUNNING_PREFIX + qid;
-        String vipKey  = WAITING_PREFIX + "vip";
-        String mainKey = WAITING_PREFIX + "main";
-        
-        redis.opsForZSet().remove(runKey, user);
-        boolean waitingRemoved = redis.opsForZSet().remove(vipKey, user) == 1;
-        if (!waitingRemoved) redis.opsForZSet().remove(mainKey, user);
+        @SuppressWarnings("unchecked")
+        List<Object> res = (List<Object>) redis.execute(
+            enterScript,
+            List.of(vipRun, mainRun, targetRun, vipWait, mainWait, cfgKey, seqKey),
+            String.valueOf(now),
+            String.valueOf(fallbackMax),
+            user,
+            isVip ? "1" : "0",
+            String.valueOf(VIP_PRIORITY_BONUS)
+        );
 
-        promoteNextUser(qid);
-        broadcastStatus(qid);
-        if (qid.equals("vip")) {
-            broadcastStatus("main");
-        } else if (qid.equals("main")) {
-            broadcastStatus("vip");
+        if (res == null || res.size() < 2) {
+            broadcastStatus(group, "vip");
+            broadcastStatus(group, "main");
+            return waiting(-1);
         }
-        // log.info("leave " + user);
+
+        String state = String.valueOf(res.get(0));
+        long pos = 0;
+        try {
+            pos = Long.parseLong(String.valueOf(res.get(1)));
+        } catch (Exception ignore) {
+        }
+
+        broadcastStatus(group, "vip");
+        broadcastStatus(group, "main");
+        return "entered".equals(state) ? entered() : waiting(pos);
     }
 
-    /* =================== WS 연결 종료 =================== */
-    @EventListener
-    public void onWebsocketDisconnected(UserDisconnectedEvent ev) {
-        if (ev.userId() != null) leave(ev.qid(), ev.userId());
-    }
-
-    /* ====================== 상태 ======================= */
-    public QueueStatus status(String qid) {
-        String vipRunKey  = RUNNING_PREFIX + "vip";
-        String mainRunKey = RUNNING_PREFIX + "main";
-        String vipWaitKey  = WAITING_PREFIX + "vip";
-        String mainWaitKey = WAITING_PREFIX + "main";
-
-        long runSize = size(vipRunKey) + size(mainRunKey);
-        long waitSize = size(vipWaitKey) + size(mainWaitKey);
-        
-        return new QueueStatus(runSize, waitSize, size(vipWaitKey), size(mainWaitKey));
-    }
-
-    public Map<String, Long> QueuePosition(String qid, String userId) {
-        long pos = absolutePosition(qid, userId);
-        return Map.of("pos", pos);
-    }
-
-
-    /* ===================== 내부 로직 ==================== */
-    private void promoteNextUser(String qid) {
-        String runKey  = RUNNING_PREFIX + qid;
-        String vipKey  = WAITING_PREFIX + "vip";
-        String mainKey = WAITING_PREFIX + "main";
-        if (totalRunningSize() >= MAX_runnging) return;
-
-        // 1) VIP 대기자 우선 승격
-        Set<String> vipBatch = redis.opsForZSet().range(vipKey, 0, 0);
-        if (vipBatch != null && !vipBatch.isEmpty()) {
-            String uid = vipBatch.iterator().next();
-            redis.opsForZSet().remove(vipKey, uid);
-            redis.opsForZSet().add(runKey, uid, Instant.now().toEpochMilli());
-            notifier.sendToUser(uid, "{\"type\":\"ENTER\"}");
+    public void leave(String group, String qid, String user) {
+        validateGroupAndQid(group, qid);
+        if (user == null || user.isBlank()) {
             return;
         }
-        // 2) 일반 대기자 승격
-        Set<String> mainBatch = redis.opsForZSet().range(mainKey, 0, 0);
-        if (mainBatch != null && !mainBatch.isEmpty()) {
-            String uid = mainBatch.iterator().next();
-            redis.opsForZSet().remove(mainKey, uid);
-            redis.opsForZSet().add(runKey, uid, Instant.now().toEpochMilli());
-            notifier.sendToUser(uid, "{\"type\":\"ENTER\"}");
+
+        boolean removedVipRunning = removeFromZSet(runKey(group, "vip"), user);
+        boolean removedMainRunning = removeFromZSet(runKey(group, "main"), user);
+        removeFromZSet(waitKey(group, "vip"), user);
+        removeFromZSet(waitKey(group, "main"), user);
+
+        if (removedVipRunning) {
+            promoteNextUser(group, "vip");
+        }
+        if (removedMainRunning) {
+            promoteNextUser(group, "main");
+        }
+
+        broadcastStatus(group, "vip");
+        broadcastStatus(group, "main");
+    }
+
+    public void touch(String group, String qid, String user) {
+        validateGroupAndQid(group, qid);
+        if (user == null || user.isBlank()) {
+            return;
+        }
+
+        long now = Instant.now().toEpochMilli();
+        touchRunKey(runKey(group, "vip"), user, now);
+        touchRunKey(runKey(group, "main"), user, now);
+    }
+
+    @EventListener
+    public void onUserPing(UserPingEvent ev) {
+        touch(ev.group(), ev.qid(), ev.userId());
+    }
+
+    @EventListener
+    public void onWebsocketDisconnected(UserDisconnectedEvent ev) {
+        if (ev.userId() != null) {
+            leave(ev.group(), ev.qid(), ev.userId());
         }
     }
 
-    private void broadcastStatus(String qid) {
+    public QueueStatus status(String group) {
+        validateGroup(group);
+        long runSize = size(runKey(group, "vip")) + size(runKey(group, "main"));
+        long vipWait = size(waitKey(group, "vip"));
+        long mainWait = size(waitKey(group, "main"));
+        long waitSize = vipWait + mainWait;
+        return new QueueStatus(runSize, waitSize, vipWait, mainWait);
+    }
+
+    public Map<String, Long> queuePosition(String group, String qid, String userId) {
+        validateGroupAndQid(group, qid);
+        return Map.of("pos", absolutePosition(group, qid, userId));
+    }
+
+    public Map<String, Object> isRunning(String group, String qid, String userId) {
+        validateGroupAndQid(group, qid);
+        boolean running = isRunningInAnyQueue(group, userId);
+        long pos = running ? 0L : absolutePosition(group, qid, userId);
+        return Map.of("running", running, "pos", pos);
+    }
+
+    private int maxRunning(String group) {
+        Object v = redis.opsForHash().get("config:{" + group + "}", "maxRunning");
         try {
-             // 1) 현재 상태 집계
-            long runningCnt = size(RUNNING_PREFIX + qid);
-            long vipCnt = size(WAITING_PREFIX + "vip");
-            long mainCnt = size(WAITING_PREFIX + "main");
+            int n = (v == null) ? 30 : Integer.parseInt(String.valueOf(v));
+            return Math.max(1, n);
+        } catch (Exception e) {
+            return 30;
+        }
+    }
+
+    private static final String LUA_PROMOTE_WITH_CAP = """
+    -- KEYS: 1 vipWaitKey, 2 mainWaitKey, 3 vipRunKey, 4 mainRunKey, 5 targetRunKey, 6 configKey
+    -- ARGV: 1 nowMs, 2 fallbackMaxRunning, 3 vipStreakLimit
+    local vipWaitKey   = KEYS[1]
+    local mainWaitKey  = KEYS[2]
+    local vipRunKey    = KEYS[3]
+    local mainRunKey   = KEYS[4]
+    local targetRunKey = KEYS[5]
+    local configKey    = KEYS[6]
+
+    local nowMs  = tonumber(ARGV[1])
+    local fmax   = tonumber(ARGV[2]) or 1
+    local limit  = tonumber(ARGV[3]) or 3
+
+    local m = redis.call('HGET', configKey, 'maxRunning')
+    local maxRunning = tonumber(m) or fmax
+    if not maxRunning or maxRunning < 1 then maxRunning = 1 end
+
+    local function totalRunning()
+      return (redis.call('ZCARD', vipRunKey) or 0) + (redis.call('ZCARD', mainRunKey) or 0)
+    end
+
+    if totalRunning() >= maxRunning then
+      return nil
+    end
+
+    local vipStreak = tonumber(redis.call('HGET', configKey, 'vip_streak')) or 0
+    local primaryWait   = (targetRunKey == vipRunKey) and vipWaitKey  or mainWaitKey
+    local secondaryWait = (targetRunKey == vipRunKey) and mainWaitKey or vipWaitKey
+
+    local waitMain = redis.call('ZCARD', mainWaitKey) or 0
+    if (targetRunKey == vipRunKey) and (vipStreak >= limit) and (waitMain > 0) then
+      primaryWait, secondaryWait = mainWaitKey, vipWaitKey
+    end
+
+    local popped = redis.call('ZPOPMIN', primaryWait, 1)
+    if (not popped) or (#popped == 0) then
+      popped = redis.call('ZPOPMIN', secondaryWait, 1)
+    end
+    if not popped or #popped == 0 then
+      return nil
+    end
+
+    local uid = popped[1]
+    redis.call('ZADD', targetRunKey, nowMs, uid)
+
+    if targetRunKey == vipRunKey then
+      if primaryWait == vipWaitKey then
+        redis.call('HINCRBY', configKey, 'vip_streak', 1)
+      else
+        redis.call('HSET', configKey, 'vip_streak', 0)
+      end
+    else
+      redis.call('HSET', configKey, 'vip_streak', 0)
+    end
+
+    return uid
+    """;
+
+    private final RedisScript<String> promoteScript =
+        new DefaultRedisScript<>(LUA_PROMOTE_WITH_CAP, String.class);
+
+    private static final String LUA_ENTER = """
+    -- KEYS: 1 vipRunKey, 2 mainRunKey, 3 targetRunKey, 4 vipWaitKey, 5 mainWaitKey, 6 configKey, 7 seqKey
+    -- ARGV: 1 nowMs, 2 fallbackMaxRunning, 3 userId, 4 isVip(0/1), 5 vipBias
+
+    local vipRunKey    = KEYS[1]
+    local mainRunKey   = KEYS[2]
+    local targetRunKey = KEYS[3]
+    local vipWaitKey   = KEYS[4]
+    local mainWaitKey  = KEYS[5]
+    local configKey    = KEYS[6]
+    local seqKey       = KEYS[7]
+
+    local nowMs   = tonumber(ARGV[1])
+    local fmax    = tonumber(ARGV[2]) or 1
+    local uid     = ARGV[3]
+    local isVip   = tonumber(ARGV[4]) == 1
+    local vipBias = tonumber(ARGV[5]) or 0
+
+    local function maxRunning()
+      local m = redis.call('HGET', configKey, 'maxRunning')
+      local v = tonumber(m) or fmax
+      if not v or v < 1 then v = 1 end
+      return v
+    end
+
+    local function totalRunning()
+      return (redis.call('ZCARD', vipRunKey) or 0) + (redis.call('ZCARD', mainRunKey) or 0)
+    end
+
+    if redis.call('ZSCORE', vipRunKey, uid) or redis.call('ZSCORE', mainRunKey, uid) then
+      return { "entered", "0" }
+    end
+
+    local waitVip  = redis.call('ZCARD', vipWaitKey) or 0
+    local waitMain = redis.call('ZCARD', mainWaitKey) or 0
+    local totalWait = waitVip + waitMain
+
+    if totalWait == 0 and totalRunning() < maxRunning() then
+      redis.call('ZADD', targetRunKey, nowMs, uid)
+      return { "entered", "0" }
+    end
+
+    local inVip  = redis.call('ZSCORE', vipWaitKey, uid)
+    local inMain = redis.call('ZSCORE', mainWaitKey, uid)
+
+    local targetWaitKey = isVip and vipWaitKey or mainWaitKey
+    if (not inVip) and (not inMain) then
+      local seq = redis.call('INCR', seqKey)
+      local micro = nowMs * 1000 + (seq % 1000)
+      local score = isVip and (micro - vipBias) or micro
+      redis.call('ZADD', targetWaitKey, 'NX', score, uid)
+    else
+      targetWaitKey = inVip and vipWaitKey or mainWaitKey
+    end
+
+    local r = redis.call('ZRANK', targetWaitKey, uid)
+    if not r then
+      return { "waiting", "-1" }
+    end
+
+    local localRank = r + 1
+    if targetWaitKey == mainWaitKey then
+      return { "waiting", tostring(waitVip + localRank) }
+    end
+    return { "waiting", tostring(localRank) }
+    """;
+
+    @SuppressWarnings("rawtypes")
+    private final RedisScript<List> enterScript =
+        new DefaultRedisScript<>(LUA_ENTER, List.class);
+
+    private void promoteNextUser(String group, String qid) {
+        final String vipWait = waitKey(group, "vip");
+        final String mainWait = waitKey(group, "main");
+        final String vipRun = runKey(group, "vip");
+        final String mainRun = runKey(group, "main");
+        final String targetRun = runKey(group, qid);
+        final String config = cfgKey(group);
+
+        String now = String.valueOf(Instant.now().toEpochMilli());
+        int fallbackMax = Math.max(1, maxRunning(group));
+
+        String uid = redis.execute(
+            promoteScript,
+            List.of(vipWait, mainWait, vipRun, mainRun, targetRun, config),
+            now,
+            String.valueOf(fallbackMax),
+            String.valueOf(VIP_STREAK_LIMIT)
+        );
+
+        if (uid != null && !uid.isBlank()) {
+            notifier.sendToUser(group, uid, "{\"type\":\"ENTER\"}");
+        }
+    }
+
+    private void broadcastStatus(String group, String qid) {
+        try {
+            long runningCnt = size(runKey(group, qid));
+            long vipCnt = size(waitKey(group, "vip"));
+            long mainCnt = size(waitKey(group, "main"));
             long totalWaiting = vipCnt + mainCnt;
 
-            // 2) 이 큐의 대기자 리스트
-            String waitKey = WAITING_PREFIX + qid;
+            String waitKey = waitKey(group, qid);
             Set<String> waiters = redis.opsForZSet().range(waitKey, 0, -1);
-            if (waiters == null) return;
+            if (waiters == null) {
+                return;
+            }
 
-            // 3) 각 사용자에게 개별 STATUS+pos 전송
             for (String uid : waiters) {
-                // ZSET 내 0-based rank → 1-based 순번
                 Long rank = redis.opsForZSet().rank(waitKey, uid);
                 long localRank = (rank == null ? 0L : rank) + 1;
+                long pos = "main".equals(qid) ? vipCnt + localRank : localRank;
 
-                // main 큐라면 VIP 수 보정
-                long pos = qid.equals("main")
-                         ? vipCnt + localRank
-                         : localRank;
-
-                // JSON 생성
                 ObjectNode node = om.createObjectNode()
-                    .put("type",        "STATUS")
-                    .put("qid",         qid)
-                    .put("running",     runningCnt)
-                    .put("waitingVip",  vipCnt)
+                    .put("type", "STATUS")
+                    .put("group", group)
+                    .put("qid", qid)
+                    .put("running", runningCnt)
+                    .put("waitingVip", vipCnt)
                     .put("waitingMain", mainCnt)
-                    .put("waiting",     totalWaiting)
-                    .put("pos",         pos);
+                    .put("waiting", totalWaiting)
+                    .put("pos", pos);
 
-                // 개인 세션으로 전송
-                notifier.sendToUser(uid, node.toString());
+                notifier.sendToUser(group, uid, node.toString());
             }
         } catch (Exception e) {
             log.error("broadcast fail", e);
         }
     }
 
-    /* ================== 보조 메서드 =================== */
+    private boolean removeFromZSet(String key, String user) {
+        Long removed = redis.opsForZSet().remove(key, user);
+        return removed != null && removed > 0;
+    }
+
+    private void touchRunKey(String key, String user, long now) {
+        if (redis.opsForZSet().score(key, user) != null) {
+            redis.opsForZSet().add(key, user, now);
+        }
+    }
+
+    private boolean isRunningInAnyQueue(String group, String user) {
+        return redis.opsForZSet().score(runKey(group, "vip"), user) != null
+            || redis.opsForZSet().score(runKey(group, "main"), user) != null;
+    }
+
     private long size(String key) {
         Long v = redis.opsForZSet().size(key);
         return v == null ? 0 : v;
-    }
-
-    private long totalRunningSize() {
-        // 1) running:* 패턴에 맞는 모든 키 가져오기
-        Set<String> keys = redis.keys(RUNNING_PREFIX + "*");
-        if (keys == null || keys.isEmpty()) return 0L;
-
-        // 2) 각 ZSET 크기를 합산
-        long total = 0;
-        for (String k : keys) {
-            Long sz = redis.opsForZSet().size(k);
-            total += (sz == null ? 0L : sz);
-        }
-        return total;
     }
 
     private long position(String waitKey, String user) {
@@ -198,22 +378,56 @@ public class QueueService {
         return r == null ? -1 : r + 1;
     }
 
-    // 절대 순번 계산 (main 큐는 VIP 대기열 보정)
-    private long absolutePosition(String qid, String user) {
-        String waitKey = WAITING_PREFIX + qid;
+    private long absolutePosition(String group, String qid, String user) {
+        String waitKey = waitKey(group, qid);
         long rank = position(waitKey, user);
-        if (rank < 0) return -1;
+        if (rank < 0) {
+            return -1;
+        }
         if ("main".equals(qid)) {
-            Long vipObj = redis.opsForZSet().size(WAITING_PREFIX + "vip");
-            long vipCnt = vipObj == null ? 0L : vipObj;
+            long vipCnt = size(waitKey(group, "vip"));
             return vipCnt + rank;
         }
         return rank;
     }
 
-    /* ===================== DTO ====================== */
+    private void validateGroupAndQid(String group, String qid) {
+        validateGroup(group);
+        if (!"vip".equals(qid) && !"main".equals(qid)) {
+            throw new IllegalArgumentException("Unsupported qid: " + qid);
+        }
+    }
+
+    private void validateGroup(String group) {
+        if (!"site".equals(group) && !"predict".equals(group)) {
+            throw new IllegalArgumentException("Unsupported group: " + group);
+        }
+    }
+
+    private static String slot(String group) {
+        return (group == null || group.isBlank()) ? "" : "{" + group + "}:";
+    }
+
+    private static String runKey(String group, String qid) {
+        return RUNNING_PREFIX + slot(group) + qid;
+    }
+
+    private static String waitKey(String group, String qid) {
+        return WAITING_PREFIX + slot(group) + qid;
+    }
+
+    private static String cfgKey(String group) {
+        return "config:" + slot(group).replace(":{", "{");
+    }
+
     public record QueueStatus(long running, long waiting, long waitingVip, long waitingMain) {}
     public record QueueResponse(boolean entered, long position) {}
-    private QueueResponse entered()            { return new QueueResponse(true, 0); }
-    private QueueResponse waiting(long pos)    { return new QueueResponse(false, pos); }
+
+    private QueueResponse entered() {
+        return new QueueResponse(true, 0);
+    }
+
+    private QueueResponse waiting(long pos) {
+        return new QueueResponse(false, pos);
+    }
 }
