@@ -37,15 +37,30 @@ npm run build
 
 ## 📦 주요 기능
 
-- **동시 접속자 N명 제한**: 초과 사용자는 순서 기반 대기열로 이동  
-- **Redis SET + ZSET** 활용 => **멀티 큐 확장**: `vip`, `main` 등 `qid` 파라미터로 여러 등급 큐 운영  
-  - `active_users` (SET): 서비스 이용 중  => `running:<qid>` (ZSET): 서비스 이용 중 (`score = 입장 시각`)  
-  - `waiting_queue` (ZSET): 대기열 (`score = timestamp`) => `waiting:<qid>` (ZSET): 대기열 (`score = 대기 시작 시각`)  
-- **1초 단위 자동 승격** (`waiting → running`)  
-- **세션 TTL 만료 처리** (`running → finished`)  
-- **실시간 현황 + 개인 알림** 단일 WebSocket으로 처리  
-- **Admin API**로 `throughput`·`sessionTtlMillis` 실시간 조정  
-- **React 모달 UI**: 내 순번 실시간 갱신  
+- **그룹별 Running 정원 관리**: `site`, `predict`가 각각 독립적인 `maxRunning`을 사용한다.
+- **등급별 대기열**: 그룹 안에서 `vip`, `main` Waiting과 Running을 구분한다.
+- **원자적 입장 처리**: Lua가 정원, 중복 등록, 즉시 입장, Waiting 등록을 한 번에 처리한다.
+- **VIP 공정성 정책**: VIP를 우선하되 연속 3명 승급 후 Main 대기자가 있으면 Main을 선택한다.
+- **명시적 퇴장과 TTL 만료**: `/queue/leave`는 즉시 제거하며 비정상 종료는 heartbeat TTL로 정리한다.
+- **원자적 만료·승급**: TTL 만료 사용자 제거와 빈자리 승급을 하나의 Lua 스크립트에서 처리한다.
+- **개인 WebSocket 알림**: 사용자별로 `STATUS`, `ENTER`, `TIMEOUT` 메시지를 전송한다.
+- **전체 Running 집계 통일**: REST와 WebSocket 모두 VIP+Main 전체를 `running`으로 제공한다.
+- **중복 WebSocket 교체**: `group + userId` 기준으로 최신 연결만 유지한다.
+- **관리자 설정 API**: HTTP Basic ADMIN 인증 후 그룹별 설정을 조회·변경할 수 있다.
+- **React 데모 UI**: 입장, 명시적 퇴장, heartbeat, 순번 및 Running 현황 표시를 제공한다.
+
+### Redis 데이터 모델
+
+모든 상태 키는 ZSET이고, 같은 그룹의 키는 Redis Cluster에서 동일 슬롯을 사용하도록 `{group}` hash tag를 포함한다.
+
+| 용도 | 키 예시 | ZSET score |
+| --- | --- | --- |
+| VIP Running | `running:{site}:vip` | 마지막 heartbeat 시각(ms) |
+| Main Running | `running:{site}:main` | 마지막 heartbeat 시각(ms) |
+| VIP Waiting | `waiting:{site}:vip` | 우선순위가 반영된 입장 점수 |
+| Main Waiting | `waiting:{site}:main` | 입장 시각과 sequence 기반 점수 |
+| 그룹 설정 | `config:{site}` | Redis Hash |
+| 동순위 방지 sequence | `seq:{site}` | Redis String counter |
 
 ---
 
@@ -53,29 +68,84 @@ npm run build
 
 ```mermaid
 flowchart LR
-  FE[React 클라이언트] 
-    -- REST (/queue) --> QS[QueueService]
-    -- WS (/queue-status) --> WSH[WebSocketHandler]
-  subgraph BE[Spring Boot]
-    QS
-    WSH
-    JOB[QueueJobService ⏱]
-    ADM[QueueAdminController]
+  FE[React Client]
+  REDIS[(Redis ZSET / Hash)]
+
+  subgraph APP[Spring Boot]
+    QC[QueueController]
+    QS[QueueService]
+    QJ[QueueJobService]
+    QSP[QueueStatusPublisher]
+    QN[QueueNotifier]
+    WSH[QueueWebSocketHandler]
+    QAC[QueueAdminController]
   end
-  QS -- push/broadcast --> WSH
-  WSH -- heartbeat 이벤트 --> QS
-  JOB -- ZPOPMIN/ZRANGEBYSCORE --> Redis[(SET + ZSET)]
-  ADM -- HSET config --> Redis
-  QS -- SCARD/ZCARD --> Redis
-````
 
-1. **QueueService**: `/enter`, `/leave`, `/status`, `/position` REST API
-2. **WebSocketHandler**: 전체 현황 브로드캐스트 + 개인 ENTER/TIMEOUT 메시지
-3. **JobService** (@Scheduled)
+  FE -- REST /queue/* --> QC
+  QC --> QS
+  QS -- Lua / ZSET --> REDIS
 
-   * **promote** (1초): `waiting:{qid}` → `running:{qid}`
-   * **expire** (10초): TTL 지난 세션 `running:{qid}` → `finished:{qid}`
-4. **AdminController**: `config:{qid}` 해시로 `throughput`/`sessionTtlMillis` 조정
+  FE -- WS /queue-status + PING --> WSH
+  WSH -- UserPingEvent --> QS
+
+  QJ -- every 10s: expire + promote Lua --> REDIS
+  QS --> QSP
+  QJ --> QSP
+  QSP -- read ordered waiting state --> REDIS
+  QSP --> QN
+  QN --> WSH
+  WSH -- STATUS / ENTER / TIMEOUT --> FE
+
+  FE -- ADMIN HTTP Basic --> QAC
+  QAC -- config Hash --> REDIS
+```
+
+### 컴포넌트 역할
+
+1. **QueueController**
+   - `/queue/enter`, `/queue/leave`, `/queue/position`, `/queue/status`, `/queue/isRunning` 제공
+   - `QueueValidator`를 통해 `group`, `qid`, `userId` 검증
+2. **QueueService**
+   - 입장·명시적 퇴장·heartbeat 갱신 처리
+   - 입장과 승급을 Lua로 원자적으로 실행
+3. **QueueJobService**
+   - 10초마다 Running TTL 만료 검사
+   - 만료 제거와 후속 승급을 Lua로 원자 처리
+4. **QueueStatusPublisher**
+   - 전체 Running 및 VIP/Main Waiting을 한 형식으로 계산
+   - `ZRANGE` 결과 순서로 개인 순번을 계산하고 대기자에게 상태 전송
+5. **QueueWebSocketHandler**
+   - `/queue-status` 연결, 중복 세션 교체, heartbeat 이벤트 발행
+   - 닫힌 연결을 Redis 퇴장으로 처리하지 않음
+   - 동시 전송 보호 및 사용자별 메시지 전달
+6. **QueueAdminController**
+   - `config:{site}`, `config:{predict}` Hash 조회·변경
+   - `/admin/queue/**`는 ADMIN 권한 필요
+
+### 주요 처리 흐름
+
+```text
+POST /queue/enter
+  → 입력 검증
+  → Lua에서 전체 Running 정원 및 중복 확인
+  → 빈자리이고 Waiting이 없으면 즉시 Running
+  → 아니면 VIP/Main Waiting에 등록
+  → 전체 상태 발행
+
+WebSocket PING
+  → UserPingEvent
+  → 해당 사용자의 Running score를 현재 시각으로 갱신
+
+POST /queue/leave
+  → Running/Waiting에서 즉시 제거
+  → Running 빈자리 발생 시 다음 Waiting 사용자 승급
+  → ENTER 및 STATUS 전송
+
+10초 TTL 작업
+  → TTL이 지난 Running 사용자 원자적 제거
+  → 제거된 인원만큼 정원 내에서 Waiting 사용자 승급
+  → TIMEOUT, ENTER 및 STATUS 전송
+```
 
 ---
 
@@ -90,15 +160,15 @@ flowchart LR
 ### 백엔드 실행
 
 ```bash
-cd backend-spring-boot
+cd queueSystem
 ./gradlew bootRun
 ```
 
 ### 프런트엔드 실행
 
 ```bash
-cd frontend-react
-npm install
+cd front/my-app
+npm ci
 npm start
 ```
 
@@ -113,179 +183,164 @@ npm start
 **기본 QueueConfig** (Redis 해시가 비어 있을 때)
 
 * `throughput = 10/sec`
-* `sessionTtlMillis = 120_000ms (2분)`
+* `sessionTtlMillis = 30_000ms (30초)`
+* `maxRunning = 30`
 
 ---
 
 ## 🛠 트러블슈팅
 
-| 증상                 | 원인                                            | 해결                                  |
-| ------------------ | --------------------------------------------- | ----------------------------------- |
-| WRONGTYPE Redis 오류 | ZSET 키를 SET API로 조회                           | `opsForZSet().size()` 사용            |
-| 입장 직후 즉시 퇴장        | React Strict-Mode 더블 언마운트, WebSocket 재연결 | WS close에서는 제거하지 않고 heartbeat TTL로 처리 |
-| 대기번호 역주행           | `waiting + 1` 잘못 계산                           | waiting 감소분만 반영                     |
-| 대기번호 미갱신           | `/queue/position` API 오류/폴링 실패                | HTTP 폴링 제거, waiting diff 로컬 계산      |
-| Bean 순환 참조         | Service ↔ WebSocketHandler 상호 의존              | `QueueNotifier` 인터페이스로 단방향 참조       |
-| VIP 진입 시 Main 화면 순번 오류   | 전체 브로드캐스트(`notifier.broadcast`) 사용 | 큐별 대기자만 `sendToUser`로 브로드캐스트 변경  |
-| diff 계산 오차               | diff+REST 혼용 → race condition 발생   | WebSocket으로 **절대 pos** 푸시 방식 전환  |
-| Redis `KEYS` 명령 과부하      | 대규모 키 스캔 시 블로킹                     | 운영 시 `SCAN` 명령으로 변경              |
-|VIP 큐 변화 시, main 큐 갱신X|broadcast에서 qid에 해당 대기열만 STATUS 메시지 전송|VIP 큐 변화 시 main 큐 상태도 함께 전송</br>→ 각 사용자에게 절대 순번이 포함된 STATUS 메시지 전송|
+| 증상 | 원인 | 현재 처리 및 확인 사항 |
+| --- | --- | --- |
+| 새로고침·네트워크 전환 후 연결이 끊기거나 비정상 종료 사용자가 잠시 Running에 남아 있음 | WebSocket 연결과 Redis 이용 상태의 생명주기를 분리함 | WebSocket 종료 시 메모리 세션만 제거한다. 정상 퇴장은 `POST /queue/leave`를 호출하고, 비정상 종료는 마지막 `PING` 이후 `sessionTtlMillis`가 지나면 자동 정리된다. TTL 안에 재연결하면 기존 Redis 상태를 유지한다. |
+| WebSocket 연결 직후 종료됨 | `group`, `qid`, `userId`가 누락됐거나 허용되지 않은 값 | `group`은 `site` 또는 `predict`, `qid`는 `vip` 또는 `main`, `userId`는 공백이 아닌 값이어야 한다. 잘못된 연결은 `BAD_DATA`로 종료된다. |
+| REST와 WebSocket의 Running 수 또는 VIP/Main 상태가 예상과 다름 | 전체 Running과 등급별 Running을 혼동했거나 이전 상태 형식을 사용함 | `running`은 항상 `runningVip + runningMain`이다. WebSocket `STATUS`에서 등급별 값도 확인한다. 승급 사용자는 실제 등급에 맞는 Running 키에 저장된다. |
+| Main 순번이 갱신되지 않거나 표시 순번과 실제 승급 순서가 다름 | VIP 변화가 Main 순번에 영향을 주며, 실제 승급에는 VIP 연속 승급 제한도 적용됨 | VIP와 Main 상태를 함께 다시 발행한다. `pos`는 VIP 우선 정렬 기준의 예상 순번이며 정확한 입장 시각을 보장하지 않는다. |
+| 대기자가 많을 때 상태 갱신이 느림 | 상태 발행마다 모든 대기자를 읽고 사용자별 WebSocket 메시지를 전송함 | 반복 `ZRANK`는 제거했지만 전송량은 대기자 수에 비례한다. 대규모 운영에서는 발행 주기 제한, 변경 임계값 또는 개인 순번 조회 방식 적용을 고려한다. |
+| Redis에서 `WRONGTYPE` 오류 발생 | 기존 데이터가 현재 ZSET 기반 키 구조와 다른 타입으로 남아 있음 | Running/Waiting 키 타입을 확인한다. 이전 버전의 SET 키가 남아 있다면 서비스 중단 및 데이터 보존 정책을 정한 뒤 ZSET 구조로 마이그레이션한다. |
+| 관리자 API가 `401`/`403`을 반환하거나 다른 사용자의 `userId`로 요청할 수 있음 | 관리자 API만 HTTP Basic ADMIN 인증을 사용하고 일반 Queue API는 아직 클라이언트 `userId`를 신뢰함 | 관리자 요청에는 올바른 Basic 인증을 사용한다. 운영 환경에서는 일반 API와 WebSocket도 로그인 세션, JWT 또는 서명된 queue token과 연동해야 한다. |
 
 ---
 
 ## ⚡ 확장 & 운영
 
-### 1) WS + SSE 분리
+### 1) 관리자 설정
 
-* **SSE**(`/queue/stream`): 전체 현황 브로드캐스트
-* **WS**(`/queue-status`): 개인 알림만 처리
+관리자 API는 HTTP Basic 인증이 필요하다. 기본 개발 계정은 애플리케이션 기본값일 뿐이며 운영에서는 반드시 환경별로 변경한다.
 
-```js
-// Frontend 예시
-const evt = new EventSource('/queue/stream');
-evt.onmessage = e => {
-  const { active, waiting } = JSON.parse(e.data);
-  setActive(active); setWaiting(waiting);
-};
-
-const ws = new WebSocket('/queue-status?userId=...');
+```properties
+app.admin.username=queue-admin
+app.admin.password-hash={bcrypt}<bcrypt-password-hash>
 ```
 
-### 2) Admin API로 실시간 튜닝
+현재 설정 조회:
 
 ```bash
-# 조회
-curl http://localhost:8080/admin/queue/main
-
-# throughput=50, TTL=30분
-curl -X POST "http://localhost:8080/admin/queue/main" \
-     -d "throughput=50&sessionTtlMillis=1800000"
+curl -u queue-admin:password \
+  http://localhost:8080/admin/queue
 ```
-### 3) 멀티 큐 지원 추가(완료)
 
-#### Redis 키 네이밍
+그룹별 설정 변경:
 
-| 큐 ID(qid) | 실행중 (ZSET)     | 대기열 (ZSET)     |
-| --------- | -------------- | -------------- |
-| `vip`     | `running:vip`  | `waiting:vip`  |
-| `main`    | `running:main` | `waiting:main` |
+```bash
+curl -u queue-admin:password -X POST \
+  "http://localhost:8080/admin/queue/site?sessionTtlMillis=60000&maxRunning=50"
+```
 
----
+| 필드 | 기본값 | 현재 용도 |
+| --- | ---: | --- |
+| `sessionTtlMillis` | `30000` | 마지막 heartbeat 이후 Running 만료 기준 |
+| `maxRunning` | `30` | VIP+Main 전체 Running 정원 |
+| `throughput` | `10` | 설정·조회는 지원하지만 현재 승급 Lua의 처리량 제한에는 사용하지 않음 |
 
-#### REST 컨트롤러
+`throughput`을 실제 초당 승급 제한으로 사용하려면 별도의 rate-limit 정책과 원자적 카운터를 추가해야 한다.
 
-```java
-    @PostMapping("/enter")
-    public QueueService.QueueResponse enter(@RequestParam String qid, @RequestParam("userId") String userId) {
-        return svc.enter(qid, userId);
-    }
+### 2) REST API
 
-    @PostMapping("/leave")
-    public void leave(@RequestParam String qid, @RequestParam("userId") String userId) {
-        svc.leave(qid, userId);
-    }
+| Method | Path | 주요 파라미터 | 응답/동작 |
+| --- | --- | --- | --- |
+| `POST` | `/queue/enter` | `group`, `qid`, `userId` | `{entered, position}` |
+| `POST` | `/queue/leave` | `group`, `qid`, `userId` | Running/Waiting에서 명시적 제거 |
+| `GET` | `/queue/position` | `group`, `qid`, `userId` | `{pos}` |
+| `GET` | `/queue/status` | `group` | 전체 Running 및 VIP/Main Waiting |
+| `GET` | `/queue/isRunning` | `group`, `qid`, `userId` | `{running, pos}` |
 
-    @GetMapping("/status")
-    public QueueService.QueueStatus status(@RequestParam String qid) { return svc.status(qid); }
+허용 값은 현재 코드에 고정되어 있다.
 
-    @GetMapping("/position")
-    public Map<String, Long> QueuePosition(@RequestParam String qid, @RequestParam("userId") String userId) {
-        return svc.QueuePosition(qid, userId);
-    }
+```text
+group: site | predict
+qid:   vip | main
+```
+
+새 그룹이나 등급을 추가하려면 `QueueValidator`, 스케줄 대상, 설정 로딩 및 Lua 키 구성을 함께 확장해야 한다. 설정 파일에 이름만 추가하는 동적 확장은 아직 지원하지 않는다.
+
+### 3) WebSocket 계약
+
+연결 URL:
+
+```text
+ws://localhost:8080/queue-status?group=site&qid=main&userId=user123
+```
+
+클라이언트는 연결 직후와 이후 5초마다 텍스트 `PING`을 전송한다. 서버 메시지는 JSON이다.
+
+```json
+{
+  "type": "STATUS",
+  "group": "site",
+  "qid": "main",
+  "running": 30,
+  "runningVip": 10,
+  "runningMain": 20,
+  "waitingVip": 5,
+  "waitingMain": 8,
+  "waiting": 13,
+  "pos": 9
 }
 ```
 
-#### Admin 컨트롤러(throughput, ttl 갱신)
-
-```java
-@RestController
-@RequestMapping("/admin/queue")
-@RequiredArgsConstructor
-public class QueueAdminController {
-
-    private final RedisTemplate<String, String> redis;
-
-    /** 현재 설정 조회 */
-    @GetMapping("/{qid}")
-    public QueueConfig getConfig(@PathVariable String qid) {
-        Map<Object,Object> m = redis.opsForHash().entries("config:" + qid);
-        return QueueConfig.from(m);
-    }
-
-    /** throughput, sessionTtlMillis 동시 갱신 */
-    @PostMapping("/{qid}")
-    public void updateConfig(@PathVariable String qid,
-                             @RequestParam(required = false) Integer throughput,
-                             @RequestParam(required = false) Long sessionTtlMillis) {
-        if (throughput != null) {
-            redis.opsForHash().put("config:" + qid, "throughput", throughput.toString());
-        }
-        if (sessionTtlMillis != null) {
-            redis.opsForHash().put("config:" + qid, "sessionTtlMillis", sessionTtlMillis.toString());
-        }
-    }
+```json
+{"type":"ENTER"}
 ```
 
-#### `broadcastStatus(qid)` (절대 pos 보정)
-
-```java
- private void broadcastStatus(String qid) {
-        try {
-             // 1) 현재 상태 집계
-            long runningCnt = size(RUNNING_PREFIX + qid);
-            long vipCnt = size(WAITING_PREFIX + "vip");
-            long mainCnt = size(WAITING_PREFIX + "main");
-            long totalWaiting = vipCnt + mainCnt;
-
-            // 2) 이 큐의 대기자 리스트
-            String waitKey = WAITING_PREFIX + qid;
-            Set<String> waiters = redis.opsForZSet().range(waitKey, 0, -1);
-            if (waiters == null) return;
-
-            // 3) 각 사용자에게 개별 STATUS+pos 전송
-            for (String uid : waiters) {
-                // ZSET 내 0-based rank → 1-based 순번
-                Long rank = redis.opsForZSet().rank(waitKey, uid);
-                long localRank = (rank == null ? 0L : rank) + 1;
-
-                // main 큐라면 VIP 수 보정
-                long pos = qid.equals("main")
-                         ? vipCnt + localRank
-                         : localRank;
-
-                // JSON 생성
-                ObjectNode node = om.createObjectNode()
-                    .put("type",        "STATUS")
-                    .put("qid",         qid)
-                    .put("running",     runningCnt)
-                    .put("waitingVip",  vipCnt)
-                    .put("waitingMain", mainCnt)
-                    .put("waiting",     totalWaiting)
-                    .put("pos",         pos);
-
-                // 개인 세션으로 전송
-                notifier.sendToUser(uid, node.toString());
-            }
-        } catch (Exception e) {
-            log.error("broadcast fail", e);
-        }
-    }
+```json
+{"type":"TIMEOUT"}
 ```
 
-#### React 클라이언트 처리
+WebSocket 종료는 퇴장 요청이 아니다. 정상적으로 서비스를 떠날 때는 반드시 `POST /queue/leave`를 호출해야 하며, 호출하지 못한 비정상 종료는 TTL 작업이 정리한다.
 
-```jsx
-ws.onmessage = e => {
-  const msg = JSON.parse(e.data);
-  if (msg.type==='STATUS' && msg.qid===qid) {
-    setRunning(msg.running);
-    setWaitingVip(msg.waitingVip);
-    setWaitingMain(msg.waitingMain);
-    setWaiting(msg.waitingVip + msg.waitingMain);
-    setPos(msg.pos);
-  }
-};
+### 4) Redis Cluster
+
+한 Lua 호출에 사용되는 그룹별 키는 동일한 hash tag를 공유한다.
+
+```text
+running:{site}:vip
+running:{site}:main
+waiting:{site}:vip
+waiting:{site}:main
+config:{site}
+seq:{site}
 ```
+
+따라서 `site`와 `predict`는 서로 다른 슬롯에 배치될 수 있고, 각 그룹 내부 Lua 연산은 동일 슬롯에서 실행된다. 키 이름을 변경할 때는 `{group}` 부분을 유지해야 한다.
+
+### 5) 수평 확장 시 고려 사항
+
+Redis 상태와 Lua 원자성은 여러 애플리케이션 인스턴스에서도 공유되지만 WebSocket 세션 Map은 각 인스턴스의 로컬 메모리에 있다.
+
+```text
+Instance A WebSocket Map ─┐
+                          ├─ Redis queue state
+Instance B WebSocket Map ─┘
+```
+
+현재 `QueueNotifier`는 로컬 인스턴스에 연결된 사용자에게만 메시지를 보낼 수 있다. 다중 인스턴스에서는 다음 중 하나가 필요하다.
+
+- Redis Pub/Sub 또는 Streams로 사용자 알림을 모든 인스턴스에 전달
+- WebSocket sticky session 적용
+- 전용 WebSocket gateway와 세션 라우팅 저장소 도입
+
+스케줄러도 모든 인스턴스에서 실행된다. Lua가 상태 변경을 원자적으로 처리해 중복 승급 위험을 줄이지만, 운영 부하와 알림 중복을 통제하려면 리더 선출 또는 분산 락을 고려한다.
+
+### 6) 대규모 대기열
+
+현재 상태 발행은 반복 `ZRANK`를 제거했지만 `ZRANGE 0 -1`로 모든 대기자를 읽고 사용자별 WebSocket 메시지를 전송한다. 대기자가 매우 많으면 Redis 응답 크기와 전송량이 선형으로 증가한다.
+
+대규모 운영에서는 다음 개선을 고려한다.
+
+- 상태 발행 주기를 제한하고 짧은 시간의 변경을 합치기
+- 사용자의 순번이 일정 범위 이상 변했을 때만 push
+- 개인 순번은 클라이언트가 3~5초 간격으로 조회
+- 전체 현황과 개인 알림 채널 분리
+- 메트릭: 그룹별 Running/Waiting, 만료 수, 승급 수, Lua 지연, WebSocket 전송 실패율
+
+### 7) 인증과 신뢰 경계
+
+- `/admin/queue/**`는 ADMIN 권한으로 보호된다.
+- 일반 Queue REST와 WebSocket의 `userId`는 현재 클라이언트 입력을 신뢰한다.
+- 운영 환경에서는 로그인 세션/JWT의 subject 또는 서버가 서명한 queue token에서 `userId`, `group`, `qid`를 결정해야 한다.
+- WebSocket allowed origin은 현재 `*`이므로 운영 배포에서는 허용 프런트엔드 origin으로 제한해야 한다.
+- 기본 Redis 비밀번호와 관리자 기본 계정을 운영 환경에서 사용하지 않는다.
 
 
 ## 📖 참고 자료
