@@ -190,15 +190,101 @@ npm start
 
 ## 🛠 트러블슈팅
 
+WebSocket 연결 종료를 실제 서비스 퇴장으로 간주하면서 새로고침이나 일시적인 네트워크 장애에도 Running 사용자가 제거되는 문제가 있었다. 이를 해결하기 위해 WebSocket 세션과 Redis 이용 상태의 생명주기를 분리하고, Running 상태는 heartbeat TTL로 관리하도록 변경했다. 이 과정에서 VIP/Main 등급 보존, 상태 집계 방식, 순번 발행 성능과 WebSocket 동시 전송 안정성도 함께 개선했다.
+
+### 문제 1. 일시적인 WebSocket 종료가 실제 퇴장으로 처리됨
+
+이전에는 WebSocket이 닫히면 `UserDisconnectedEvent`를 발행하고 `QueueService.leave()`를 즉시 호출했다. 새로고침, 네트워크 전환, 일시적인 연결 장애도 실제 퇴장으로 처리되어 사용자가 Running에서 제거되고 다음 대기자가 잘못 승급할 수 있었다.
+
+#### 해결: 즉시 `leave()` 제거 및 상태별 생명주기 분리
+
+현재는 WebSocket 종료 시 `QueueWebSocketHandler`의 메모리 세션만 제거한다. Redis 상태 제거 기준은 다음과 같이 상태별로 다르다.
+
+- Waiting과 Running 사용자는 명시적인 `POST /queue/leave`로 즉시 제거된다.
+- Running 사용자는 마지막 heartbeat 이후 `sessionTtlMillis`가 지나면 자동 제거된다.
+- Waiting 사용자의 자동 TTL 만료 정책은 현재 적용하지 않는다.
+
+```text
+WebSocket 종료
+  → 메모리 WebSocket 세션만 제거
+  → Redis Running/Waiting 유지
+
+명시적 POST /queue/leave
+  → Redis에서 즉시 제거
+  → Running 빈자리 발생 시 다음 사용자 승급
+
+heartbeat TTL 만료
+  → 스케줄러가 Redis Running에서 만료 사용자 제거
+  → 제거된 인원만큼 다음 사용자 승급
+```
+
+### 문제 2. 비정상 종료 사용자를 안전하게 정리해야 함
+
+#### 해결: heartbeat 기반 Running 생명주기 관리
+
+클라이언트는 WebSocket 연결 직후와 이후 5초마다 `PING`을 보낸다. 서버는 `UserPingEvent`를 통해 해당 사용자의 Running ZSET score를 현재 시각으로 갱신한다. `QueueJobService`는 10초마다 마지막 heartbeat가 TTL 기준보다 오래된 사용자를 찾아 제거한다.
+
+TTL 안에 WebSocket을 재연결하고 `PING`을 다시 보내면 기존 Running score가 갱신되어 이용 상태를 유지한다. 반대로 `/queue/leave`를 보내지 못한 비정상 종료 사용자는 heartbeat가 중단되므로 TTL 이후 자동 정리된다.
+
+### 문제 3. 승급 사용자의 VIP/Main Running 등급이 섞임
+
+이전 승급 Lua는 빈자리가 발생한 Running 키에 선택된 사용자를 넣어 Main 사용자가 VIP Running에 들어가거나 그 반대가 될 수 있었다. 현재는 실제로 사용자를 꺼낸 Waiting 키를 `selectedWait`로 추적하여 VIP는 `running:{group}:vip`, Main은 `running:{group}:main`에 저장한다.
+
+VIP와 Main은 Running 키를 등급별로 분리하지만 별도 정원을 갖지 않는다. 두 Running ZSET 크기의 합을 기준으로 그룹의 동일한 `maxRunning`을 공유한다.
+
+### 문제 4. 상태 집계와 순번 발행 기준이 서로 다름
+
+#### 해결: 상태 형식과 순번 계산 통일
+
+- REST와 WebSocket의 `running`을 VIP+Main 전체 Running 수로 통일했다.
+- WebSocket `STATUS`에 `runningVip`, `runningMain`을 함께 제공한다.
+- VIP 상태가 변할 때 Main 대기자의 절대 순번도 다시 계산해 발행한다.
+- `ZRANGE` 후 사용자마다 실행하던 반복 `ZRANK`를 제거하고 정렬 결과의 반복 인덱스로 순번을 계산한다.
+
+단, `pos`는 현재 VIP 우선 정렬을 반영한 표시용 예상 순번이다. VIP 연속 승급 제한과 실시간 퇴장·만료에 따라 실제 입장 순서나 입장 시각은 달라질 수 있다.
+
+### 문제 5. 잘못된 연결과 동시 전송으로 WebSocket이 불안정함
+
+#### 해결: 연결 검증과 세션 전송 보호
+
+- `group`, `qid`, `userId`를 연결 직후 검증하고 잘못된 요청은 WebSocket close code `1007`(`BAD_DATA`)과 `Invalid queue parameters` reason으로 종료한다.
+- 동일한 `group + userId`의 새 연결이 들어오면 이전 연결을 교체한다.
+- 이전 연결의 종료 처리가 새 연결을 Map에서 제거하지 않도록 현재 세션을 비교한다.
+- `ConcurrentWebSocketSessionDecorator`로 동일 세션의 동시 전송을 보호한다.
+- 이미 닫힌 세션에는 메시지를 전송하지 않는다.
+
+클라이언트에서는 `onclose` 이벤트의 `code`와 `reason`으로 파라미터 거부 여부를 확인할 수 있다.
+
+### 검증 시나리오
+
+1. Running 사용자의 WebSocket만 닫았을 때 Redis Running 상태가 즉시 삭제되지 않는지 확인한다.
+2. TTL 안에 다시 연결하고 `PING`을 보냈을 때 Running score가 갱신되는지 확인한다.
+3. `PING`을 중단한 뒤 `sessionTtlMillis`와 최대 10초의 스케줄 주기가 지나면 Running에서 제거되는지 확인한다.
+4. `POST /queue/leave`를 호출하면 Waiting 또는 Running에서 즉시 제거되는지 확인한다.
+5. 프런트의 `beforeunload`, `pagehide`, `useEffect` cleanup 및 WebSocket `onclose`에서 `/queue/leave`를 자동 호출하지 않는지 확인한다. 현재 React 데모의 cleanup과 `onclose`는 WebSocket만 닫는다.
+6. VIP/Main 승급 후 사용자가 실제 등급의 Running 키에 존재하는지 확인한다.
+7. 잘못된 `group`, `qid`, `userId`로 연결했을 때 close code `1007`과 reason을 확인한다.
+
+### 증상별 확인
+
 | 증상 | 원인 | 현재 처리 및 확인 사항 |
 | --- | --- | --- |
-| 새로고침·네트워크 전환 후 연결이 끊기거나 비정상 종료 사용자가 잠시 Running에 남아 있음 | WebSocket 연결과 Redis 이용 상태의 생명주기를 분리함 | WebSocket 종료 시 메모리 세션만 제거한다. 정상 퇴장은 `POST /queue/leave`를 호출하고, 비정상 종료는 마지막 `PING` 이후 `sessionTtlMillis`가 지나면 자동 정리된다. TTL 안에 재연결하면 기존 Redis 상태를 유지한다. |
-| WebSocket 연결 직후 종료됨 | `group`, `qid`, `userId`가 누락됐거나 허용되지 않은 값 | `group`은 `site` 또는 `predict`, `qid`는 `vip` 또는 `main`, `userId`는 공백이 아닌 값이어야 한다. 잘못된 연결은 `BAD_DATA`로 종료된다. |
+| 새로고침·네트워크 전환 후 연결이 끊기거나 비정상 종료 사용자가 잠시 Running에 남아 있음 | WebSocket 연결과 Redis 이용 상태의 생명주기를 분리함 | 정상 퇴장은 `POST /queue/leave`를 호출한다. 비정상 종료는 마지막 `PING` 이후 `sessionTtlMillis`가 지나면 자동 정리된다. TTL 안에 재연결한 뒤 `PING`이 도착해야 기존 상태가 갱신된다. |
+| Waiting 사용자가 자동으로 만료되지 않음 | heartbeat TTL은 Running에만 적용됨 | 현재 정상 동작이다. Waiting 사용자는 명시적인 `/queue/leave`로 제거한다. 자동 정리가 필요하면 Waiting 전용 TTL 정책을 별도로 구현해야 한다. |
+| WebSocket 연결 직후 종료됨 | `group`, `qid`, `userId`가 누락됐거나 허용되지 않은 값 | `group`은 `site` 또는 `predict`, `qid`는 `vip` 또는 `main`, `userId`는 공백이 아닌 값이어야 한다. 클라이언트 `onclose`에서 code `1007`과 reason을 확인한다. |
 | REST와 WebSocket의 Running 수 또는 VIP/Main 상태가 예상과 다름 | 전체 Running과 등급별 Running을 혼동했거나 이전 상태 형식을 사용함 | `running`은 항상 `runningVip + runningMain`이다. WebSocket `STATUS`에서 등급별 값도 확인한다. 승급 사용자는 실제 등급에 맞는 Running 키에 저장된다. |
 | Main 순번이 갱신되지 않거나 표시 순번과 실제 승급 순서가 다름 | VIP 변화가 Main 순번에 영향을 주며, 실제 승급에는 VIP 연속 승급 제한도 적용됨 | VIP와 Main 상태를 함께 다시 발행한다. `pos`는 VIP 우선 정렬 기준의 예상 순번이며 정확한 입장 시각을 보장하지 않는다. |
-| 대기자가 많을 때 상태 갱신이 느림 | 상태 발행마다 모든 대기자를 읽고 사용자별 WebSocket 메시지를 전송함 | 반복 `ZRANK`는 제거했지만 전송량은 대기자 수에 비례한다. 대규모 운영에서는 발행 주기 제한, 변경 임계값 또는 개인 순번 조회 방식 적용을 고려한다. |
 | Redis에서 `WRONGTYPE` 오류 발생 | 기존 데이터가 현재 ZSET 기반 키 구조와 다른 타입으로 남아 있음 | Running/Waiting 키 타입을 확인한다. 이전 버전의 SET 키가 남아 있다면 서비스 중단 및 데이터 보존 정책을 정한 뒤 ZSET 구조로 마이그레이션한다. |
-| 관리자 API가 `401`/`403`을 반환하거나 다른 사용자의 `userId`로 요청할 수 있음 | 관리자 API만 HTTP Basic ADMIN 인증을 사용하고 일반 Queue API는 아직 클라이언트 `userId`를 신뢰함 | 관리자 요청에는 올바른 Basic 인증을 사용한다. 운영 환경에서는 일반 API와 WebSocket도 로그인 세션, JWT 또는 서명된 queue token과 연동해야 한다. |
+| 관리자 API가 `401` 또는 `403`을 반환함 | HTTP Basic 인증 정보가 없거나 ADMIN 권한이 없음 | 올바른 관리자 계정을 사용하고 Spring Security 설정을 확인한다. |
+| 다른 사용자의 `userId`로 Queue API 또는 WebSocket 요청이 가능함 | 일반 Queue API가 클라이언트의 `userId`를 신뢰함 | 현재 알려진 보안 제한이다. 운영에서는 세션, JWT 또는 서명된 queue token으로 서버가 사용자 ID를 결정해야 한다. |
+
+### 현재 남은 제한사항
+
+- Waiting 사용자의 자동 만료 정책은 없다.
+- `STATUS` 발행은 모든 대기자를 읽고 개인 메시지를 보내므로 전송량이 대기자 수에 비례한다.
+- `pos`는 표시용 예상 순번이며 정확한 입장 순서나 입장 시각을 보장하지 않는다.
+- 일반 Queue API와 WebSocket은 아직 클라이언트가 전달한 `userId`를 신뢰한다.
+- WebSocket 세션 Map은 인스턴스 메모리에 있으므로 다중 서버에서는 Pub/Sub, sticky session 또는 별도 세션 라우팅이 필요하다.
 
 ---
 
