@@ -2,6 +2,34 @@
 
 Spring Boot, Redis **대기열 시스템**  
 
+## 2026-07-30 업데이트
+
+YuGiOhDeck에서 운영 중인 대기열 구현을 독립 프로젝트에 동기화했다.
+
+- `site`, `predict` 그룹별 Redis 키 분리
+- `vip`, `main` 대기열과 전체 Running 정원 통합 관리
+- Redis Lua 스크립트로 입장 및 승급을 원자적으로 처리
+- WebSocket 세션을 `group + userId` 기준으로 관리하고 중복 연결 교체
+- 5초 heartbeat와 그룹별 세션 TTL 만료 처리
+- Running 이탈·만료 시 Waiting 사용자를 즉시 승급
+- 대기 순번을 Redis `ZRANK` 기준 `STATUS` 메시지로 사용자별 전송
+- REST API의 `group`, `qid`, `userId` 입력값 검증
+- 관리자 API에서 그룹별 `throughput`, `sessionTtlMillis`, `maxRunning` 설정 지원
+- React 데모가 현재 호스트의 WebSocket을 사용하고 heartbeat를 전송하도록 변경
+
+기본 TTL은 `30,000ms`, 기본 최대 Running 수는 그룹별 `30명`이다. 운영 환경에서는 Redis의 `config:{site}`, `config:{predict}` 해시로 값을 조정할 수 있다.
+
+검증:
+
+```bash
+cd queueSystem
+./gradlew test
+
+cd ../front/my-app
+npm ci
+npm run build
+```
+
 ---
 
 ## 📦 주요 기능

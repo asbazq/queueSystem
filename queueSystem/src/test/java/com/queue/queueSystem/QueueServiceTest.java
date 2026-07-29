@@ -17,15 +17,15 @@ class QueueServiceTest {
         ZSetOperations<String, String> zset = Mockito.mock(ZSetOperations.class);
         Mockito.when(redis.opsForZSet()).thenReturn(zset);
 
-        Mockito.when(zset.size("running:vip")).thenReturn(2L);
-        Mockito.when(zset.size("running:main")).thenReturn(1L);
-        Mockito.when(zset.size("waiting:vip")).thenReturn(3L);
-        Mockito.when(zset.size("waiting:main")).thenReturn(4L);
+        Mockito.when(zset.size("running:{site}:vip")).thenReturn(2L);
+        Mockito.when(zset.size("running:{site}:main")).thenReturn(1L);
+        Mockito.when(zset.size("waiting:{site}:vip")).thenReturn(3L);
+        Mockito.when(zset.size("waiting:{site}:main")).thenReturn(4L);
 
         QueueNotifier notifier = Mockito.mock(QueueNotifier.class);
         QueueService svc = new QueueService(redis, notifier);
 
-        QueueService.QueueStatus st = svc.status("main");
+        QueueService.QueueStatus st = svc.status("site");
         assertEquals(3L, st.running());
         assertEquals(7L, st.waiting());
         assertEquals(3L, st.waitingVip());

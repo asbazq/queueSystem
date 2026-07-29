@@ -4,6 +4,7 @@ import axios from 'axios';
 import QueueModal from './QueueModal';
 
 export default function App() {
+  const group = 'site';
   /* --------- State --------- */
   const [qid, setQid]           = useState('main');
   const [userId, setUserId]       = useState('');
@@ -24,7 +25,7 @@ export default function App() {
     setEntered(false);
     setPos(0);
     try {
-      await axios.post('/queue/leave', null, { params: { qid, userId } });
+      await axios.post('/queue/leave', null, { params: { group, qid, userId } });
     } catch {
       // ignore
     }
@@ -37,7 +38,7 @@ export default function App() {
   /* --------- 전체 상태 조회 함수 --------- */
   const fetchStatus = async () => {
     try {
-      const { data } = await axios.get('/queue/status', { params: { qid } });
+      const { data } = await axios.get('/queue/status', { params: { group } });
       // 실행 중 수
       setRunning(data.running ?? 0);
       // VIP / 일반 대기자 수
@@ -76,7 +77,7 @@ export default function App() {
     try {
       const { data } = await axios.post(
         '/queue/enter', null,
-        { params: { qid, userId } }
+        { params: { group, qid, userId } }
       );
       if (data.entered) {
         setEntered(true);
@@ -97,12 +98,23 @@ export default function App() {
   /* --------- WebSocket 연결 & 메시지 처리 --------- */
   useEffect(() => {
     if (!userId) return;
+    const wsBase = (window.location.protocol === 'https:' ? 'wss://' : 'ws://')
+      + window.location.host;
     const ws = new WebSocket(
-      `ws://localhost:8080/queue-status`
-      + `?qid=${encodeURIComponent(qid)}`
+      `${wsBase}/queue-status`
+      + `?group=${encodeURIComponent(group)}`
+      + `&qid=${encodeURIComponent(qid)}`
       + `&userId=${encodeURIComponent(userId)}`
     );
     wsRef.current = ws;
+    let pingTimer = null;
+
+    ws.onopen = () => {
+      ws.send('PING');
+      pingTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send('PING');
+      }, 5000);
+    };
 
     ws.onmessage = async e => {
       if (!e.data.startsWith('{')) return;
@@ -123,7 +135,7 @@ export default function App() {
       }
 
       // 수정: 항상 서버에 내 로컬 순번을 다시 요청
-      if (msg.type === 'STATUS' && msg.qid === qid) {
+      if (msg.type === 'STATUS' && msg.group === group && msg.qid === qid) {
         setRunning(msg.running ?? 0);
         setWaitingVip(msg.waitingVip ?? 0);
         setWaitingMain(msg.waitingMain?? 0);
@@ -141,7 +153,10 @@ export default function App() {
 
 
     // 언마운트 시 연결 종료
-    return () => ws.close();
+    return () => {
+      if (pingTimer) clearInterval(pingTimer);
+      ws.close();
+    };
   }, [qid, userId]);
 
   /* --------- UI --------- */
