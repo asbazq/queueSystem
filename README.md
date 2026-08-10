@@ -1,438 +1,630 @@
 # QueueSystem
 
-Spring Boot, Redis **대기열 시스템**  
+Redis와 WebSocket을 활용해 **순간적인 트래픽을 제어하기 위한 대기열 시스템**입니다.
 
-## 2026-07-30 업데이트
+서비스의 동시 이용 인원을 제한하고, 초과 사용자는 Redis 기반 대기열에서 순서를 관리합니다.
+대기 상태는 WebSocket으로 실시간 전달하며, 비정상 종료 사용자는 Heartbeat와 TTL을 이용해 자동으로 정리합니다.
 
-YuGiOhDeck에서 운영 중인 대기열 구현을 독립 프로젝트에 동기화했다.
-
-- `site`, `predict` 그룹별 Redis 키 분리
-- `vip`, `main` 대기열과 전체 Running 정원 통합 관리
-- Redis Lua 스크립트로 입장 및 승급을 원자적으로 처리
-- WebSocket 세션을 `group + userId` 기준으로 관리하고 중복 연결 교체
-- WebSocket 종료는 일시 장애로 간주하며, 명시적 `/queue/leave` 또는 heartbeat TTL 만료 때만 Redis에서 제거
-- WebSocket 연결 파라미터 검증 및 동시 전송 보호
-- 5초 heartbeat와 그룹별 세션 TTL 만료 처리
-- Running 이탈·만료 시 Waiting 사용자를 즉시 승급
-- Redis 정렬 결과의 인덱스로 순번을 계산해 사용자별 `STATUS` 메시지 전송
-- `STATUS.running`은 전체 Running이며 `runningVip`, `runningMain`을 함께 제공
-- REST API의 `group`, `qid`, `userId` 입력값 검증
-- 관리자 API에서 그룹별 `throughput`, `sessionTtlMillis`, `maxRunning` 설정 지원
-- React 데모가 현재 호스트의 WebSocket을 사용하고 heartbeat를 전송하도록 변경
-
-기본 TTL은 `30,000ms`, 기본 최대 Running 수는 그룹별 `30명`이다. 운영 환경에서는 Redis의 `config:{site}`, `config:{predict}` 해시로 값을 조정할 수 있다.
-
-검증:
-
-```bash
-cd queueSystem
-./gradlew test
-
-cd ../front/my-app
-npm ci
-npm run build
-```
+이 프로젝트는 G마켓 Red Carpet 대기열 구조를 참고하여 구현했으며, 이후 실제 운영 중인 YuGiOhDeck 프로젝트에 적용하면서 구조를 개선했습니다.
 
 ---
 
-## 📦 주요 기능
+# 프로젝트 소개
 
-- **그룹별 Running 정원 관리**: `site`, `predict`가 각각 독립적인 `maxRunning`을 사용한다.
-- **등급별 대기열**: 그룹 안에서 `vip`, `main` Waiting과 Running을 구분한다.
-- **원자적 입장 처리**: Lua가 정원, 중복 등록, 즉시 입장, Waiting 등록을 한 번에 처리한다.
-- **VIP 공정성 정책**: VIP를 우선하되 연속 3명 승급 후 Main 대기자가 있으면 Main을 선택한다.
-- **명시적 퇴장과 TTL 만료**: `/queue/leave`는 즉시 제거하며 비정상 종료는 heartbeat TTL로 정리한다.
-- **원자적 만료·승급**: TTL 만료 사용자 제거와 빈자리 승급을 하나의 Lua 스크립트에서 처리한다.
-- **개인 WebSocket 알림**: 사용자별로 `STATUS`, `ENTER`, `TIMEOUT` 메시지를 전송한다.
-- **전체 Running 집계 통일**: REST와 WebSocket 모두 VIP+Main 전체를 `running`으로 제공한다.
-- **중복 WebSocket 교체**: `group + userId` 기준으로 최신 연결만 유지한다.
-- **관리자 설정 API**: HTTP Basic ADMIN 인증 후 그룹별 설정을 조회·변경할 수 있다.
-- **React 데모 UI**: 입장, 명시적 퇴장, heartbeat, 순번 및 Running 현황 표시를 제공한다.
+## 목표
 
-### Redis 데이터 모델
+동시 접속자가 몰리는 상황에서도
 
-모든 상태 키는 ZSET이고, 같은 그룹의 키는 Redis Cluster에서 동일 슬롯을 사용하도록 `{group}` hash tag를 포함한다.
+- 서비스 이용 순서를 보장하고
+- 서버 부하를 제어하며
+- 사용자에게 실시간으로 현재 상태를 제공하는 것
 
-| 용도 | 키 예시 | ZSET score |
-| --- | --- | --- |
-| VIP Running | `running:{site}:vip` | 마지막 heartbeat 시각(ms) |
-| Main Running | `running:{site}:main` | 마지막 heartbeat 시각(ms) |
-| VIP Waiting | `waiting:{site}:vip` | 우선순위가 반영된 입장 점수 |
-| Main Waiting | `waiting:{site}:main` | 입장 시각과 sequence 기반 점수 |
-| 그룹 설정 | `config:{site}` | Redis Hash |
-| 동순위 방지 sequence | `seq:{site}` | Redis String counter |
+을 목표로 구현했습니다.
 
 ---
 
-## 🏗️ 아키텍처
+## 주요 기능
+
+- Redis Sorted Set 기반 대기열
+- VIP / Main 다중 대기열
+- Lua Script를 이용한 원자적 입장 처리
+- WebSocket 기반 실시간 상태 알림
+- Heartbeat + TTL 기반 비정상 종료 처리
+- 관리자 API를 통한 실시간 Queue 설정 변경
+
+---
+
+## 기술 스택
+
+| 분야 | 기술 |
+|------|------|
+| Language | Java 21 |
+| Framework | Spring Boot 3 |
+| Queue | Redis Sorted Set |
+| Realtime | WebSocket |
+| Atomic Operation | Redis Lua Script |
+| Frontend | React |
+| Build | Gradle |
+
+---
+
+# 시스템 아키텍처
 
 ```mermaid
-flowchart LR
-  FE[React Client]
-  REDIS[(Redis ZSET / Hash)]
+graph LR
 
-  subgraph APP[Spring Boot]
-    QC[QueueController]
-    QS[QueueService]
-    QJ[QueueJobService]
-    QSP[QueueStatusPublisher]
-    QN[QueueNotifier]
-    WSH[QueueWebSocketHandler]
-    QAC[QueueAdminController]
-  end
+CLIENT[React Client]
 
-  FE -- REST /queue/* --> QC
-  QC --> QS
-  QS -- Lua / ZSET --> REDIS
+subgraph SPRING[Spring Boot]
 
-  FE -- WS /queue-status + PING --> WSH
-  WSH -- UserPingEvent --> QS
+CONTROLLER[QueueController]
 
-  QJ -- every 10s: expire + promote Lua --> REDIS
-  QS --> QSP
-  QJ --> QSP
-  QSP -- read ordered waiting state --> REDIS
-  QSP --> QN
-  QN --> WSH
-  WSH -- STATUS / ENTER / TIMEOUT --> FE
+SERVICE[QueueService]
 
-  FE -- ADMIN HTTP Basic --> QAC
-  QAC -- config Hash --> REDIS
-```
+JOB[QueueJobService]
 
-### 컴포넌트 역할
+STATUS[QueueStatusPublisher]
 
-1. **QueueController**
-   - `/queue/enter`, `/queue/leave`, `/queue/position`, `/queue/status`, `/queue/isRunning` 제공
-   - `QueueValidator`를 통해 `group`, `qid`, `userId` 검증
-2. **QueueService**
-   - 입장·명시적 퇴장·heartbeat 갱신 처리
-   - 입장과 승급을 Lua로 원자적으로 실행
-3. **QueueJobService**
-   - 10초마다 Running TTL 만료 검사
-   - 만료 제거와 후속 승급을 Lua로 원자 처리
-4. **QueueStatusPublisher**
-   - 전체 Running 및 VIP/Main Waiting을 한 형식으로 계산
-   - `ZRANGE` 결과 순서로 개인 순번을 계산하고 대기자에게 상태 전송
-5. **QueueWebSocketHandler**
-   - `/queue-status` 연결, 중복 세션 교체, heartbeat 이벤트 발행
-   - 닫힌 연결을 Redis 퇴장으로 처리하지 않음
-   - 동시 전송 보호 및 사용자별 메시지 전달
-6. **QueueAdminController**
-   - `config:{site}`, `config:{predict}` Hash 조회·변경
-   - `/admin/queue/**`는 ADMIN 권한 필요
+WS[QueueWebSocketHandler]
 
-### 주요 처리 흐름
+end
 
-```text
-POST /queue/enter
-  → 입력 검증
-  → Lua에서 전체 Running 정원 및 중복 확인
-  → 빈자리이고 Waiting이 없으면 즉시 Running
-  → 아니면 VIP/Main Waiting에 등록
-  → 전체 상태 발행
+WAIT[(Waiting ZSET)]
 
-WebSocket PING
-  → UserPingEvent
-  → 해당 사용자의 Running score를 현재 시각으로 갱신
+RUN[(Running ZSET)]
 
-POST /queue/leave
-  → Running/Waiting에서 즉시 제거
-  → Running 빈자리 발생 시 다음 Waiting 사용자 승급
-  → ENTER 및 STATUS 전송
+CONFIG[(Config Hash)]
 
-10초 TTL 작업
-  → TTL이 지난 Running 사용자 원자적 제거
-  → 제거된 인원만큼 정원 내에서 Waiting 사용자 승급
-  → TIMEOUT, ENTER 및 STATUS 전송
+CLIENT -->|REST| CONTROLLER
+
+CONTROLLER --> SERVICE
+
+SERVICE --> WAIT
+SERVICE --> RUN
+SERVICE --> CONFIG
+
+CLIENT -->|WebSocket| WS
+
+WS -->|Heartbeat| SERVICE
+
+JOB -->|TTL| RUN
+
+SERVICE --> STATUS
+JOB --> STATUS
+
+STATUS --> WS
+
+WS -->|STATUS ENTER TIMEOUT| CLIENT
 ```
 
 ---
 
-## 🚀 빠른 시작
+# Redis 데이터 구조
 
-### 선행 조건
+대기열 상태는 모두 Redis에 저장됩니다.
 
-* Java 17+, Gradle or Maven
-* Redis 6+ (`localhost:6379`)
-* Node.js 16+ & npm
+| Key | 설명 |
+|------|------|
+| waiting:{group}:vip | VIP 대기열 |
+| waiting:{group}:main | 일반 대기열 |
+| running:{group}:vip | VIP 이용 중 |
+| running:{group}:main | 일반 이용 중 |
+| config:{group} | Queue 설정 |
+| seq:{group} | 순번 생성 |
 
-### 백엔드 실행
+Running Queue는 마지막 Heartbeat 시간을 score로 저장하고,
+
+Waiting Queue는 입장 시각과 우선순위를 score로 저장합니다.
+
+---
+
+# 핵심 구현
+
+## 1. Redis Sorted Set 기반 대기열
+
+### 왜 Redis를 사용했는가?
+
+순간적인 트래픽에서는
+
+- 빠른 삽입
+- 빠른 삭제
+- 현재 순번 조회
+
+가 모두 중요합니다.
+
+Redis Sorted Set은
+
+- ZADD
+- ZREM
+- ZRANK
+
+연산을 모두 O(log N)에 수행할 수 있으며,
+
+score를 이용해 대기 순서와 우선순위를 동시에 관리할 수 있기 때문에 선택했습니다.
+
+### 구현
+
+- VIP / Main Queue 분리
+- Waiting / Running 분리
+- 그룹(site, predict) 분리
+- score 기반 순번 관리
+
+```text
+Waiting
+
+↓
+
+Redis ZSET
+
+↓
+
+Running
+
+↓
+
+Service
+```
+
+---
+
+## 2. Redis Lua Script
+
+### 왜 Lua Script를 사용했는가?
+
+입장 과정은
+
+- 현재 Running 확인
+- 중복 확인
+- Waiting 등록
+- Running 승격
+
+여러 Redis 명령으로 이루어집니다.
+
+이를 각각 실행하면 동시에 요청이 들어왔을 때
+
+- Running 초과
+- 중복 입장
+- 순서 꼬임
+
+이 발생할 수 있습니다.
+
+### 해결
+
+입장과 승급을 하나의 Lua Script에서 실행하도록 구성했습니다.
+
+Redis 내부에서 하나의 명령처럼 수행되므로 Race Condition을 방지할 수 있습니다.
+
+---
+
+## 3. WebSocket 기반 실시간 상태 전달
+
+### 왜 WebSocket을 사용했는가?
+
+대기 순번은 실시간으로 변하는 데이터입니다.
+
+Polling 방식은 사용자가 많아질수록 동일한 요청이 계속 발생합니다.
+
+반면 WebSocket은
+
+순번이 변경될 때만 서버가 사용자에게 메시지를 전달하므로
+
+네트워크 비용과 서버 부하를 줄일 수 있습니다.
+
+### 전달하는 이벤트
+
+- STATUS
+- ENTER
+- TIMEOUT
+
+사용자는 새로고침 없이 현재 대기 상태를 확인할 수 있습니다.
+
+---
+
+## 4. Heartbeat 기반 세션 관리
+
+### 왜 Heartbeat가 필요한가?
+
+브라우저를 강제로 종료하거나
+
+네트워크가 끊기면
+
+서버는 사용자가 실제로 서비스를 떠났는지 알 수 없습니다.
+
+이를 해결하기 위해
+
+클라이언트는 5초마다 PING을 보내고,
+
+서버는 마지막 Heartbeat 시간을 Running Queue에 저장합니다.
+
+TTL을 초과한 사용자만 자동 제거하도록 구현했습니다.
+
+```text
+PING
+
+↓
+
+Running score 갱신
+
+↓
+
+TTL 검사
+
+↓
+
+만료
+
+↓
+
+Waiting 승격
+```
+
+이 구조를 통해
+
+- 새로고침
+- 일시적인 네트워크 장애
+
+는 즉시 퇴장으로 처리하지 않고,
+
+실제 비정상 종료 사용자만 자동으로 제거할 수 있습니다.
+
+---
+
+## 5. 관리자 설정
+
+관리자는 API를 통해 Queue 설정을 변경할 수 있습니다.
+
+지원 항목
+
+- maxRunning
+- sessionTtlMillis
+- throughput
+
+Redis Hash를 이용하므로 서버를 재시작하지 않아도 즉시 적용됩니다.
+
+---
+
+## 6. 처리 흐름
+
+```text
+사용자 입장
+
+↓
+
+QueueController
+
+↓
+
+QueueService
+
+↓
+
+Lua Script
+
+↓
+
+Running 가능?
+
+├── YES → Running
+
+└── NO → Waiting
+
+↓
+
+WebSocket STATUS
+
+↓
+
+Heartbeat
+
+↓
+
+TTL 검사
+
+↓
+
+Running 제거
+
+↓
+
+Waiting 승격
+
+↓
+
+ENTER 전송
+```
+
+---
+
+## 7. 실행 방법
+
+### Redis 실행
 
 ```bash
-cd queueSystem
+docker run -p 6379:6379 redis
+```
+
+### Backend
+
+```bash
 ./gradlew bootRun
 ```
 
-### 프런트엔드 실행
+### Frontend
 
 ```bash
 cd front/my-app
-npm ci
+
+npm install
+
 npm start
 ```
 
-1. 브라우저에서 `http://localhost:3000` 열기
-2. `userId` 입력 후 **입장** 클릭
-3. 정원 초과 시 모달로 대기번호 확인 → 빈 자리 생기면 자동 승격
+브라우저에서
 
+```
+http://localhost:3000
+```
+
+접속 후
+
+userId를 입력하면 대기열을 테스트할 수 있습니다.
 ---
 
-## ⚙️ 설정
+# 8. 트러블슈팅
 
-**기본 QueueConfig** (Redis 해시가 비어 있을 때)
+## 8-1. WebSocket 재연결 시 사용자가 대기열에서 사라지는 문제
 
-* `throughput = 10/sec`
-* `sessionTtlMillis = 30_000ms (30초)`
-* `maxRunning = 30`
+### 문제
 
----
+초기 구현에서는 WebSocket 연결이 종료되면 사용자가 서비스를 떠난 것으로 판단하여 `leave()`를 호출했습니다.
 
-## 🛠 트러블슈팅
+하지만 실제 서비스에서는
 
-WebSocket 연결 종료를 실제 서비스 퇴장으로 간주하면서 새로고침이나 일시적인 네트워크 장애에도 Running 사용자가 제거되는 문제가 있었다. 이를 해결하기 위해 WebSocket 세션과 Redis 이용 상태의 생명주기를 분리하고, Running 상태는 heartbeat TTL로 관리하도록 변경했다. 이 과정에서 VIP/Main 등급 보존, 상태 집계 방식, 순번 발행 성능과 WebSocket 동시 전송 안정성도 함께 개선했다.
+- 브라우저 새로고침
+- 일시적인 네트워크 끊김
+- 모바일 네트워크 전환
 
-### 문제 1. 일시적인 WebSocket 종료가 실제 퇴장으로 처리됨
+과 같은 상황에서도 WebSocket 연결 종료가 발생합니다.
 
-이전에는 WebSocket이 닫히면 `UserDisconnectedEvent`를 발행하고 `QueueService.leave()`를 즉시 호출했다. 새로고침, 네트워크 전환, 일시적인 연결 장애도 실제 퇴장으로 처리되어 사용자가 Running에서 제거되고 다음 대기자가 잘못 승급할 수 있었다.
+그 결과 정상 사용자가 Running Queue에서 제거되고, 다음 대기자가 잘못 승급되는 문제가 발생했습니다.
 
-#### 해결: 즉시 `leave()` 제거 및 상태별 생명주기 분리
+### 원인
 
-현재는 WebSocket 종료 시 `QueueWebSocketHandler`의 메모리 세션만 제거한다. Redis 상태 제거 기준은 다음과 같이 상태별로 다르다.
-
-- Waiting과 Running 사용자는 명시적인 `POST /queue/leave`로 즉시 제거된다.
-- Running 사용자는 마지막 heartbeat 이후 `sessionTtlMillis`가 지나면 자동 제거된다.
-- Waiting 사용자의 자동 TTL 만료 정책은 현재 적용하지 않는다.
+WebSocket 연결 상태와 Redis에 저장된 실제 이용 상태를 동일한 생명주기로 관리하고 있었습니다.
 
 ```text
 WebSocket 종료
-  → 메모리 WebSocket 세션만 제거
-  → Redis Running/Waiting 유지
-
-명시적 POST /queue/leave
-  → Redis에서 즉시 제거
-  → Running 빈자리 발생 시 다음 사용자 승급
-
-heartbeat TTL 만료
-  → 스케줄러가 Redis Running에서 만료 사용자 제거
-  → 제거된 인원만큼 다음 사용자 승급
+↓
+leave()
+↓
+Running 제거
+↓
+Waiting 승급
 ```
 
-### 문제 2. 비정상 종료 사용자를 안전하게 정리해야 함
+### 해결
 
-#### 해결: heartbeat 기반 Running 생명주기 관리
+WebSocket 연결과 Redis Queue 상태의 생명주기를 분리했습니다.
 
-클라이언트는 WebSocket 연결 직후와 이후 5초마다 `PING`을 보낸다. 서버는 `UserPingEvent`를 통해 해당 사용자의 Running ZSET score를 현재 시각으로 갱신한다. `QueueJobService`는 10초마다 마지막 heartbeat가 TTL 기준보다 오래된 사용자를 찾아 제거한다.
+WebSocket 종료 시에는 메모리상의 세션만 제거하고, Redis의 Running/Waiting 상태는 유지하도록 변경했습니다.
 
-TTL 안에 WebSocket을 재연결하고 `PING`을 다시 보내면 기존 Running score가 갱신되어 이용 상태를 유지한다. 반대로 `/queue/leave`를 보내지 못한 비정상 종료 사용자는 heartbeat가 중단되므로 TTL 이후 자동 정리된다.
+실제 Queue 제거는 다음 두 경우에만 수행하도록 했습니다.
 
-### 문제 3. 승급 사용자의 VIP/Main Running 등급이 섞임
+- 사용자가 명시적으로 `POST /queue/leave`를 호출한 경우
+- Heartbeat가 중단되고 TTL이 만료된 경우
 
-이전 승급 Lua는 빈자리가 발생한 Running 키에 선택된 사용자를 넣어 Main 사용자가 VIP Running에 들어가거나 그 반대가 될 수 있었다. 현재는 실제로 사용자를 꺼낸 Waiting 키를 `selectedWait`로 추적하여 VIP는 `running:{group}:vip`, Main은 `running:{group}:main`에 저장한다.
+```text
+WebSocket 종료
+↓
+메모리 세션 제거
+↓
+Redis 상태 유지
 
-VIP와 Main은 Running 키를 등급별로 분리하지만 별도 정원을 갖지 않는다. 두 Running ZSET 크기의 합을 기준으로 그룹의 동일한 `maxRunning`을 공유한다.
+Heartbeat 중단
+↓
+TTL 만료
+↓
+Running 제거
+↓
+Waiting 사용자 승급
+```
 
-### 문제 4. 상태 집계와 순번 발행 기준이 서로 다름
-
-#### 해결: 상태 형식과 순번 계산 통일
-
-- REST와 WebSocket의 `running`을 VIP+Main 전체 Running 수로 통일했다.
-- WebSocket `STATUS`에 `runningVip`, `runningMain`을 함께 제공한다.
-- VIP 상태가 변할 때 Main 대기자의 절대 순번도 다시 계산해 발행한다.
-- `ZRANGE` 후 사용자마다 실행하던 반복 `ZRANK`를 제거하고 정렬 결과의 반복 인덱스로 순번을 계산한다.
-
-단, `pos`는 현재 VIP 우선 정렬을 반영한 표시용 예상 순번이다. VIP 연속 승급 제한과 실시간 퇴장·만료에 따라 실제 입장 순서나 입장 시각은 달라질 수 있다.
-
-### 문제 5. 잘못된 연결과 동시 전송으로 WebSocket이 불안정함
-
-#### 해결: 연결 검증과 세션 전송 보호
-
-- `group`, `qid`, `userId`를 연결 직후 검증하고 잘못된 요청은 WebSocket close code `1007`(`BAD_DATA`)과 `Invalid queue parameters` reason으로 종료한다.
-- 동일한 `group + userId`의 새 연결이 들어오면 이전 연결을 교체한다.
-- 이전 연결의 종료 처리가 새 연결을 Map에서 제거하지 않도록 현재 세션을 비교한다.
-- `ConcurrentWebSocketSessionDecorator`로 동일 세션의 동시 전송을 보호한다.
-- 이미 닫힌 세션에는 메시지를 전송하지 않는다.
-
-클라이언트에서는 `onclose` 이벤트의 `code`와 `reason`으로 파라미터 거부 여부를 확인할 수 있다.
-
-### 검증 시나리오
-
-1. Running 사용자의 WebSocket만 닫았을 때 Redis Running 상태가 즉시 삭제되지 않는지 확인한다.
-2. TTL 안에 다시 연결하고 `PING`을 보냈을 때 Running score가 갱신되는지 확인한다.
-3. `PING`을 중단한 뒤 `sessionTtlMillis`와 최대 10초의 스케줄 주기가 지나면 Running에서 제거되는지 확인한다.
-4. `POST /queue/leave`를 호출하면 Waiting 또는 Running에서 즉시 제거되는지 확인한다.
-5. 프런트의 `beforeunload`, `pagehide`, `useEffect` cleanup 및 WebSocket `onclose`에서 `/queue/leave`를 자동 호출하지 않는지 확인한다. 현재 React 데모의 cleanup과 `onclose`는 WebSocket만 닫는다.
-6. VIP/Main 승급 후 사용자가 실제 등급의 Running 키에 존재하는지 확인한다.
-7. 잘못된 `group`, `qid`, `userId`로 연결했을 때 close code `1007`과 reason을 확인한다.
-
-### 증상별 확인
-
-| 증상 | 원인 | 현재 처리 및 확인 사항 |
-| --- | --- | --- |
-| 새로고침·네트워크 전환 후 연결이 끊기거나 비정상 종료 사용자가 잠시 Running에 남아 있음 | WebSocket 연결과 Redis 이용 상태의 생명주기를 분리함 | 정상 퇴장은 `POST /queue/leave`를 호출한다. 비정상 종료는 마지막 `PING` 이후 `sessionTtlMillis`가 지나면 자동 정리된다. TTL 안에 재연결한 뒤 `PING`이 도착해야 기존 상태가 갱신된다. |
-| Waiting 사용자가 자동으로 만료되지 않음 | heartbeat TTL은 Running에만 적용됨 | 현재 정상 동작이다. Waiting 사용자는 명시적인 `/queue/leave`로 제거한다. 자동 정리가 필요하면 Waiting 전용 TTL 정책을 별도로 구현해야 한다. |
-| WebSocket 연결 직후 종료됨 | `group`, `qid`, `userId`가 누락됐거나 허용되지 않은 값 | `group`은 `site` 또는 `predict`, `qid`는 `vip` 또는 `main`, `userId`는 공백이 아닌 값이어야 한다. 클라이언트 `onclose`에서 code `1007`과 reason을 확인한다. |
-| REST와 WebSocket의 Running 수 또는 VIP/Main 상태가 예상과 다름 | 전체 Running과 등급별 Running을 혼동했거나 이전 상태 형식을 사용함 | `running`은 항상 `runningVip + runningMain`이다. WebSocket `STATUS`에서 등급별 값도 확인한다. 승급 사용자는 실제 등급에 맞는 Running 키에 저장된다. |
-| Main 순번이 갱신되지 않거나 표시 순번과 실제 승급 순서가 다름 | VIP 변화가 Main 순번에 영향을 주며, 실제 승급에는 VIP 연속 승급 제한도 적용됨 | VIP와 Main 상태를 함께 다시 발행한다. `pos`는 VIP 우선 정렬 기준의 예상 순번이며 정확한 입장 시각을 보장하지 않는다. |
-| Redis에서 `WRONGTYPE` 오류 발생 | 기존 데이터가 현재 ZSET 기반 키 구조와 다른 타입으로 남아 있음 | Running/Waiting 키 타입을 확인한다. 이전 버전의 SET 키가 남아 있다면 서비스 중단 및 데이터 보존 정책을 정한 뒤 ZSET 구조로 마이그레이션한다. |
-| 관리자 API가 `401` 또는 `403`을 반환함 | HTTP Basic 인증 정보가 없거나 ADMIN 권한이 없음 | 올바른 관리자 계정을 사용하고 Spring Security 설정을 확인한다. |
-| 다른 사용자의 `userId`로 Queue API 또는 WebSocket 요청이 가능함 | 일반 Queue API가 클라이언트의 `userId`를 신뢰함 | 현재 알려진 보안 제한이다. 운영에서는 세션, JWT 또는 서명된 queue token으로 서버가 사용자 ID를 결정해야 한다. |
-
-### 현재 남은 제한사항
-
-- Waiting 사용자의 자동 만료 정책은 없다.
-- `STATUS` 발행은 모든 대기자를 읽고 개인 메시지를 보내므로 전송량이 대기자 수에 비례한다.
-- `pos`는 표시용 예상 순번이며 정확한 입장 순서나 입장 시각을 보장하지 않는다.
-- 일반 Queue API와 WebSocket은 아직 클라이언트가 전달한 `userId`를 신뢰한다.
-- WebSocket 세션 Map은 인스턴스 메모리에 있으므로 다중 서버에서는 Pub/Sub, sticky session 또는 별도 세션 라우팅이 필요하다.
+이를 통해 새로고침이나 일시적인 네트워크 장애가 실제 퇴장으로 처리되지 않도록 개선했습니다.
 
 ---
 
-## ⚡ 확장 & 운영
+## 8-2. 여러 Redis 명령 실행으로 순서가 꼬이는 문제
 
-### 1) 관리자 설정
+### 문제
 
-관리자 API는 HTTP Basic 인증이 필요하다. 기본 개발 계정은 애플리케이션 기본값일 뿐이며 운영에서는 반드시 환경별로 변경한다.
+입장 과정은
 
-```properties
-app.admin.username=queue-admin
-app.admin.password-hash={bcrypt}<bcrypt-password-hash>
+- 현재 Running 인원 확인
+- 중복 사용자 확인
+- Waiting 등록
+- Running 승격
+
+등 여러 Redis 명령으로 구성되어 있었습니다.
+
+이 작업을 Java 코드에서 각각 실행하면 동시에 여러 요청이 들어왔을 때 동일한 빈 슬롯을 확인하거나, Running 정원을 초과하는 Race Condition이 발생할 수 있었습니다.
+
+### 해결
+
+입장과 승급에 필요한 Redis 명령을 하나의 Lua Script로 묶어 Redis 내부에서 원자적으로 처리하도록 변경했습니다.
+
+이를 통해 여러 사용자가 동시에 접근하더라도 중간 상태에 다른 요청이 개입하지 않도록 했습니다.
+
+---
+
+## 8-3. VIP와 Main 사용자의 Running Queue가 섞이는 문제
+
+### 문제
+
+기존 승급 로직에서는 빈자리가 발생한 Running Queue를 기준으로 사용자를 넣었습니다.
+
+이 때문에 Main 사용자가 VIP Running에 들어가거나, VIP 사용자가 Main Running에 들어갈 가능성이 있었습니다.
+
+### 해결
+
+Lua Script에서 실제로 사용자를 꺼낸 Waiting Queue를 추적하도록 수정했습니다.
+
+```text
+waiting:{group}:vip
+→ running:{group}:vip
+
+waiting:{group}:main
+→ running:{group}:main
 ```
 
-현재 설정 조회:
+VIP와 Main은 등급별 Running Queue를 유지하면서도, 두 Running Queue의 합으로 하나의 `maxRunning` 정원을 공유하도록 구성했습니다.
 
-```bash
-curl -u queue-admin:password \
-  http://localhost:8080/admin/queue
+---
+
+## 8-4. 순번 계산 시 Redis 호출이 과도하게 발생하는 문제
+
+### 문제
+
+초기에는 모든 대기자를 조회한 뒤 각 사용자마다 `ZRANK`를 다시 호출하여 순번을 계산했습니다.
+
+```text
+ZRANGE
+↓
+User 1 → ZRANK
+User 2 → ZRANK
+User 3 → ZRANK
+...
 ```
 
-그룹별 설정 변경:
+대기자가 많아질수록 Redis 호출 수도 함께 증가했습니다.
 
-```bash
-curl -u queue-admin:password -X POST \
-  "http://localhost:8080/admin/queue/site?sessionTtlMillis=60000&maxRunning=50"
+### 해결
+
+`ZRANGE` 결과가 이미 정렬된 순서대로 반환된다는 점을 이용해 반복문의 index를 순번으로 사용하도록 변경했습니다.
+
+```text
+ZRANGE
+↓
+반환 순서의 index 사용
 ```
 
-| 필드 | 기본값 | 현재 용도 |
-| --- | ---: | --- |
-| `sessionTtlMillis` | `30000` | 마지막 heartbeat 이후 Running 만료 기준 |
-| `maxRunning` | `30` | VIP+Main 전체 Running 정원 |
-| `throughput` | `10` | 설정·조회는 지원하지만 현재 승급 Lua의 처리량 제한에는 사용하지 않음 |
+이를 통해 사용자마다 발생하던 추가 `ZRANK` 호출을 제거했습니다.
 
-`throughput`을 실제 초당 승급 제한으로 사용하려면 별도의 rate-limit 정책과 원자적 카운터를 추가해야 한다.
+---
 
-### 2) REST API
+## 8-5. WebSocket 중복 연결과 동시 전송 문제
 
-| Method | Path | 주요 파라미터 | 응답/동작 |
-| --- | --- | --- | --- |
-| `POST` | `/queue/enter` | `group`, `qid`, `userId` | `{entered, position}` |
-| `POST` | `/queue/leave` | `group`, `qid`, `userId` | Running/Waiting에서 명시적 제거 |
-| `GET` | `/queue/position` | `group`, `qid`, `userId` | `{pos}` |
-| `GET` | `/queue/status` | `group` | 전체 Running 및 VIP/Main Waiting |
-| `GET` | `/queue/isRunning` | `group`, `qid`, `userId` | `{running, pos}` |
+### 문제
 
-허용 값은 현재 코드에 고정되어 있다.
+같은 사용자가 재연결할 경우 이전 WebSocket과 새로운 WebSocket이 동시에 존재할 수 있었고, 여러 스레드가 동일한 Session에 동시에 메시지를 전송할 가능성도 있었습니다.
+
+### 해결
+
+다음 방식으로 WebSocket 세션 관리를 보완했습니다.
+
+- `group + userId` 기준으로 최신 연결만 유지했습니다.
+- 이전 세션 종료가 새로운 세션을 제거하지 않도록 현재 세션을 비교했습니다.
+- `ConcurrentWebSocketSessionDecorator`를 적용해 동일 Session의 동시 전송을 보호했습니다.
+- 이미 닫힌 Session에는 메시지를 전송하지 않도록 처리했습니다.
+- `group`, `qid`, `userId`를 연결 직후 검증하고 잘못된 요청은 종료하도록 했습니다.
+
+---
+
+# 9. REST API
+
+| Method | API | 설명 |
+|---|---|---|
+| `POST` | `/queue/enter` | 대기열에 입장합니다. |
+| `POST` | `/queue/leave` | Waiting 또는 Running 상태에서 사용자를 제거합니다. |
+| `GET` | `/queue/status` | 현재 전체 Queue 상태를 조회합니다. |
+| `GET` | `/queue/position` | 사용자의 현재 대기 순번을 조회합니다. |
+| `GET` | `/queue/isRunning` | 사용자가 현재 Running 상태인지 확인합니다. |
+
+현재 지원하는 값은 다음과 같습니다.
 
 ```text
 group: site | predict
-qid:   vip | main
+qid: vip | main
 ```
-
-새 그룹이나 등급을 추가하려면 `QueueValidator`, 스케줄 대상, 설정 로딩 및 Lua 키 구성을 함께 확장해야 한다. 설정 파일에 이름만 추가하는 동적 확장은 아직 지원하지 않는다.
-
-### 3) WebSocket 계약
-
-연결 URL:
-
-```text
-ws://localhost:8080/queue-status?group=site&qid=main&userId=user123
-```
-
-클라이언트는 연결 직후와 이후 5초마다 텍스트 `PING`을 전송한다. 서버 메시지는 JSON이다.
-
-```json
-{
-  "type": "STATUS",
-  "group": "site",
-  "qid": "main",
-  "running": 30,
-  "runningVip": 10,
-  "runningMain": 20,
-  "waitingVip": 5,
-  "waitingMain": 8,
-  "waiting": 13,
-  "pos": 9
-}
-```
-
-```json
-{"type":"ENTER"}
-```
-
-```json
-{"type":"TIMEOUT"}
-```
-
-WebSocket 종료는 퇴장 요청이 아니다. 정상적으로 서비스를 떠날 때는 반드시 `POST /queue/leave`를 호출해야 하며, 호출하지 못한 비정상 종료는 TTL 작업이 정리한다.
-
-### 4) Redis Cluster
-
-한 Lua 호출에 사용되는 그룹별 키는 동일한 hash tag를 공유한다.
-
-```text
-running:{site}:vip
-running:{site}:main
-waiting:{site}:vip
-waiting:{site}:main
-config:{site}
-seq:{site}
-```
-
-따라서 `site`와 `predict`는 서로 다른 슬롯에 배치될 수 있고, 각 그룹 내부 Lua 연산은 동일 슬롯에서 실행된다. 키 이름을 변경할 때는 `{group}` 부분을 유지해야 한다.
-
-### 5) 수평 확장 시 고려 사항
-
-Redis 상태와 Lua 원자성은 여러 애플리케이션 인스턴스에서도 공유되지만 WebSocket 세션 Map은 각 인스턴스의 로컬 메모리에 있다.
-
-```text
-Instance A WebSocket Map ─┐
-                          ├─ Redis queue state
-Instance B WebSocket Map ─┘
-```
-
-현재 `QueueNotifier`는 로컬 인스턴스에 연결된 사용자에게만 메시지를 보낼 수 있다. 다중 인스턴스에서는 다음 중 하나가 필요하다.
-
-- Redis Pub/Sub 또는 Streams로 사용자 알림을 모든 인스턴스에 전달
-- WebSocket sticky session 적용
-- 전용 WebSocket gateway와 세션 라우팅 저장소 도입
-
-스케줄러도 모든 인스턴스에서 실행된다. Lua가 상태 변경을 원자적으로 처리해 중복 승급 위험을 줄이지만, 운영 부하와 알림 중복을 통제하려면 리더 선출 또는 분산 락을 고려한다.
-
-### 6) 대규모 대기열
-
-현재 상태 발행은 반복 `ZRANK`를 제거했지만 `ZRANGE 0 -1`로 모든 대기자를 읽고 사용자별 WebSocket 메시지를 전송한다. 대기자가 매우 많으면 Redis 응답 크기와 전송량이 선형으로 증가한다.
-
-대규모 운영에서는 다음 개선을 고려한다.
-
-- 상태 발행 주기를 제한하고 짧은 시간의 변경을 합치기
-- 사용자의 순번이 일정 범위 이상 변했을 때만 push
-- 개인 순번은 클라이언트가 3~5초 간격으로 조회
-- 전체 현황과 개인 알림 채널 분리
-- 메트릭: 그룹별 Running/Waiting, 만료 수, 승급 수, Lua 지연, WebSocket 전송 실패율
-
-### 7) 인증과 신뢰 경계
-
-- `/admin/queue/**`는 ADMIN 권한으로 보호된다.
-- 일반 Queue REST와 WebSocket의 `userId`는 현재 클라이언트 입력을 신뢰한다.
-- 운영 환경에서는 로그인 세션/JWT의 subject 또는 서버가 서명한 queue token에서 `userId`, `group`, `qid`를 결정해야 한다.
-- WebSocket allowed origin은 현재 `*`이므로 운영 배포에서는 허용 프런트엔드 origin으로 제한해야 한다.
-- 기본 Redis 비밀번호와 관리자 기본 계정을 운영 환경에서 사용하지 않는다.
-
-
-## 📖 참고 자료
-
-* [G마켓 Dev Blog: Redcarpet 대기열 구조](https://dev.gmarket.com/46)
-* [Redis Sorted Set (ZSET) 문서](https://redis.io/docs/data-types/sorted-sets/)
-* [Spring Boot WebSocket 가이드](https://spring.io/guides/gs/messaging-stomp-websocket/)
 
 ---
+
+# 10. WebSocket
+
+WebSocket 엔드포인트는 다음과 같습니다.
+
+```text
+ws://localhost:8080/queue-status
+```
+
+클라이언트는 연결 후 주기적으로 `PING`을 전송합니다.
+
+```text
+PING
+```
+
+서버는 사용자 상태에 따라 다음 메시지를 전달합니다.
+
+```text
+STATUS
+```
+
+현재 대기 순번과 Running / Waiting 상태를 전달합니다.
+
+```text
+ENTER
+```
+
+사용자가 Running 상태로 승격되어 서비스에 입장할 수 있음을 알립니다.
+
+```text
+TIMEOUT
+```
+
+Heartbeat TTL이 만료되어 Running 상태에서 제거되었음을 알립니다.
+
+WebSocket 종료 자체는 실제 퇴장으로 처리하지 않습니다. 정상적으로 서비스를 떠나는 경우에는 반드시 `POST /queue/leave`를 호출해야 합니다.
+
+---
+
+# 11. 운영 및 확장 시 고려 사항
+
+현재 Queue 상태는 Redis에 저장되므로 여러 애플리케이션 인스턴스가 동일한 상태를 공유할 수 있습니다.
+
+다만 WebSocket Session은 각 Spring Boot 인스턴스의 메모리에 저장됩니다.
+
+```text
+Instance A WebSocket Map
+          │
+          ├── Redis Queue State
+          │
+Instance B WebSocket Map
+```
+
+따라서 다중 서버 환경으로 확장할 경우 다음과 같은 추가 구성이 필요합니다.
+
+- Redis Pub/Sub 또는 Streams를 이용한 인스턴스 간 메시지 전달
+- Sticky Session 적용
+- 별도의 WebSocket Gateway와 세션 라우팅 구조 도입
+
+또한 현재 `STATUS` 메시지는 대기 사용자 수에 비례해 전송량이 증가합니다.
+
+대기 규모가 커질 경우 다음과 같은 최적화를 고려할 수 있습니다.
+
+- 일정 범위 이상 순번이 변경된 경우에만 Push
+- 개인 순번을 주기적으로 조회하는 방식과 혼합
+- 상태 발행 주기 제한
+- 전체 상태와 개인 알림 채널 분리
+
+---
+
+# 12. 향후 개선
+
+현재 구조에서 다음 기능을 추가로 고려하고 있습니다.
+
+- Redis Pub/Sub 기반 다중 서버 WebSocket 메시지 전달
+- JWT 또는 서명된 Queue Token 기반 사용자 식별
+- Prometheus / Grafana를 이용한 Queue 모니터링
+- 그룹별 Running / Waiting / TTL 만료 / 승급 지표 수집
+- 대기 인원과 처리 속도를 기반으로 한 예상 대기 시간 제공
+- 대규모 Queue 환경에서의 STATUS 전송 최적화
+- 운영 환경에서 WebSocket Origin 제한 강화
